@@ -1,12 +1,9 @@
 """
-models.py — Multi-Model Engine
-- Trains Linear, Ridge, Lasso, DecisionTree, RF, GBoost, KNN, SVR, XGBoost
-- Supports caching per-stat
-- Returns best model based on MAE
+models.py — Multi-Model Engine (KNN Safe Version)
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -55,28 +52,37 @@ class ModelManager:
             mse = mean_squared_error(y_test, preds)
             self.models[name] = ModelInfo(name, model, float(mae), float(mse))
 
+        # Core linear models
         _eval("LinearRegression", LinearRegression())
         _eval("Ridge", Ridge(random_state=self.random_state))
         _eval("Lasso", Lasso(random_state=self.random_state))
+
+        # Tree models
         _eval("DecisionTree", DecisionTreeRegressor(random_state=self.random_state))
         _eval("RandomForest", RandomForestRegressor(
             n_estimators=300, random_state=self.random_state, n_jobs=-1))
         _eval("GradientBoosting", GradientBoostingRegressor(random_state=self.random_state))
-        _eval("KNN", KNeighborsRegressor())
+
+        # KNN allowed only if dataset is large enough
+        if len(X_train) >= 10:
+            _eval("KNN", KNeighborsRegressor())
+
+        # SVR model
         _eval("SVR", SVR(kernel="rbf"))
 
+        # XGBoost
         if xgb is not None:
             _eval("XGBoost",
-                  xgb.XGBRegressor(
-                      n_estimators=300,
-                      learning_rate=0.07,
-                      max_depth=5,
-                      subsample=0.8,
-                      colsample_bytree=0.8,
-                      random_state=self.random_state,
-                      tree_method="hist"
-                  )
-                 )
+                xgb.XGBRegressor(
+                    n_estimators=300,
+                    learning_rate=0.07,
+                    max_depth=5,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    random_state=self.random_state,
+                    tree_method="hist"
+                )
+            )
 
         return self.models
 
