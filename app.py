@@ -1,10 +1,5 @@
 """
-NBA Prop Predictor — Pro Tier (Stability Patch)
-Fixes:
-- 1D TARGET array
-- Proper SUM for combo props
-- Correct season handling for 2025–2026
-- Ensures X_final and y_final line up
+NBA Prop Predictor — Pro Tier (Stability Patch + TARGET Fix)
 """
 
 from __future__ import annotations
@@ -40,7 +35,7 @@ STAT_COLUMNS = ["PTS","REB","AST","STL","BLK","TOV","FG3M","MIN"]
 
 
 # ======================================================================
-# FEATURE ENGINEERING UTILITIES
+# FEATURE ENGINEERING HELPERS
 # ======================================================================
 
 def compute_opponent_strength(df):
@@ -82,25 +77,21 @@ def context_features(df):
 
 
 # ======================================================================
-# CUSTOM FEATURE SET PER PROP STAT
+# PER-PROP FEATURE BUILDER
 # ======================================================================
 
 def build_features_for_stat(df, stat):
     df = df.copy()
 
-    # list of raw cols that belong to this stat
-    if isinstance(PROP_MAP[stat], list):
-        cols = PROP_MAP[stat]
-    else:
-        cols = [PROP_MAP[stat]]
+    # Get columns related to this stat
+    cols = PROP_MAP[stat] if isinstance(PROP_MAP[stat], list) else [PROP_MAP[stat]]
 
-    # build engineered features for these columns
+    # Build custom features for each underlying stat
     for col in cols:
         df = lag_features(df, col)
         df = rolling_features(df, col)
         df = trend_feature(df, col)
 
-    # universal features
     base_cols = ["IS_HOME","REST_DAYS","BACK_TO_BACK",
                  "OPP_ALLOW_PTS","OPP_ALLOW_REB","OPP_ALLOW_AST"]
 
@@ -109,19 +100,21 @@ def build_features_for_stat(df, stat):
         "WL","VIDEO_AVAILABLE","OPP_TEAM"
     ]
 
+    # Drop non-numerical columns
     X = df.drop(columns=ignore, errors="ignore")
     X = X.select_dtypes(include=["float","int"])
 
-    # ensure base columns are present
+    # Fill base columns
     for bc in base_cols:
         if bc in df.columns:
             X[bc] = df[bc].fillna(df[bc].median())
 
-    return X.dropna()
+    X = X.dropna()
+    return X
 
 
 # ======================================================================
-# DATASET BUILDER
+# TRAINING DATA PREPARATION
 # ======================================================================
 
 def build_training_dataset(logs):
@@ -139,7 +132,7 @@ def build_training_dataset(logs):
 
 
 # ======================================================================
-# MODEL CACHE — one model per stat per player
+# MODEL CACHE: One model per player, per stat
 # ======================================================================
 
 @st.cache_resource
@@ -150,7 +143,7 @@ def get_cached_model(player_id, stat, X, y):
 
 
 # ======================================================================
-# PLAYER LIST
+# PLAYER LIST CACHE
 # ======================================================================
 
 @st.cache_data(show_spinner=False)
@@ -167,12 +160,12 @@ def load_player_list():
 
 
 # ======================================================================
-# MAIN APP
+# MAIN
 # ======================================================================
 
 def main():
     st.set_page_config(page_title="NBA Prop Predictor Pro", page_icon="🏀", layout="wide")
-    st.title("NBA Prop Predictor — Full Auto-Prop Mode")
+    st.title("NBA Prop Predictor — Full Auto Mode (Stability Patch)")
 
     players = load_player_list()
 
@@ -186,18 +179,12 @@ def main():
         st.info("Choose a player and click 'Get Predictions Now'")
         return
 
-    # ================================
-    # USE 2025–2026 SEASON FIRST
-    # ================================
-    season_str = "2025-26"
-
-    logs = dfetch.get_player_game_logs_nba(player_id, season_str)
-
+    # === USE 2025–26 SEASON ===
+    logs = dfetch.get_player_game_logs_nba(player_id, "2025-26")
     if logs.empty:
-        st.warning("2025–26 season not found, falling back to current season")
         year = datetime.date.today().year
-        fallback_season = f"{year-1}-{str(year)[-2:]}"
-        logs = dfetch.get_player_game_logs_nba(player_id, fallback_season)
+        fallback = f"{year-1}-{str(year)[-2:]}"
+        logs = dfetch.get_player_game_logs_nba(player_id, fallback)
 
     if logs.empty:
         st.error("No game logs found.")
@@ -211,32 +198,35 @@ def main():
 
         df_local = df.copy()
 
-        # build TARGET safely (1D)
+        # ====================================================
+        # FIXED TARGET LOGIC — ALWAYS 1D
+        # ====================================================
         if isinstance(PROP_MAP[stat], list):
             df_local["TARGET"] = df_local[PROP_MAP[stat]].sum(axis=1)
         else:
             df_local["TARGET"] = df_local[PROP_MAP[stat]]
 
-        # enforce numeric 1D
-        df_local["TARGET"] = pd.to_numeric(df_local["TARGET"], errors="coerce")
-        df_local["TARGET"] = df_local["TARGET"].astype(float)
+        df_local["TARGET"] = pd.to_numeric(df_local["TARGET"], errors="coerce").astype(float)
         df_local["TARGET"] = df_local["TARGET"].squeeze()
 
         y = df_local["TARGET"]
 
-        # build custom features
+        # Build features
         X = build_features_for_stat(df_local, stat)
 
-        # align
+        # Align  
         df_final = pd.concat([y, X], axis=1).dropna()
+        df_final = df_final.loc[:, ~df_final.columns.duplicated()]  # REMOVE DUPLICATES
+
         y_final = df_final["TARGET"]
         X_final = df_final.drop(columns=["TARGET"])
 
-        # train or load cached model
+        # Train / Load cached
         manager = get_cached_model(player_id, stat, X_final, y_final)
 
         X_next = X_final.tail(1)
         predictions = manager.predict(X_next)
+
         best = manager.best_model()
 
         results.append({
@@ -247,8 +237,8 @@ def main():
             "MSE": best.mse
         })
 
-    st.subheader("Predicted Props")
-    st.dataframe(pd.DataFrame(results), use_container_width=True)
+    st.subheader("Predictions")
+    st.dataframe(pd.DataFrame(results))
 
     st.subheader("Recent Games")
     st.dataframe(
