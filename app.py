@@ -193,7 +193,7 @@ def main():
 
     logs = dfetch.get_player_game_logs_nba(player_id, season_str)
 
-    if logs.empty():
+    if logs.empty:
         st.warning("2025–26 season not found, falling back to current season")
         year = datetime.date.today().year
         fallback_season = f"{year-1}-{str(year)[-2:]}"
