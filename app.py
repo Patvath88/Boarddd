@@ -1,11 +1,10 @@
 """
-NBA Prop Predictor — Pro Tier (Final Build)
-Predicts ALL NBA props for a selected player using:
-- Per-stat custom feature sets
-- Cached models for instant predictions
-- Multi-model ML ensemble (Linear, RF, XGB, etc.)
-- Automatic best-model selection per stat
-- Detailed MAE/MSE reporting
+NBA Prop Predictor — Pro Tier (Stability Patch)
+Fixes:
+- 1D TARGET array
+- Proper SUM for combo props
+- Correct season handling for 2025–2026
+- Ensures X_final and y_final line up
 """
 
 from __future__ import annotations
@@ -89,16 +88,19 @@ def context_features(df):
 def build_features_for_stat(df, stat):
     df = df.copy()
 
+    # list of raw cols that belong to this stat
     if isinstance(PROP_MAP[stat], list):
         cols = PROP_MAP[stat]
     else:
         cols = [PROP_MAP[stat]]
 
+    # build engineered features for these columns
     for col in cols:
         df = lag_features(df, col)
         df = rolling_features(df, col)
         df = trend_feature(df, col)
 
+    # universal features
     base_cols = ["IS_HOME","REST_DAYS","BACK_TO_BACK",
                  "OPP_ALLOW_PTS","OPP_ALLOW_REB","OPP_ALLOW_AST"]
 
@@ -110,12 +112,12 @@ def build_features_for_stat(df, stat):
     X = df.drop(columns=ignore, errors="ignore")
     X = X.select_dtypes(include=["float","int"])
 
+    # ensure base columns are present
     for bc in base_cols:
         if bc in df.columns:
             X[bc] = df[bc].fillna(df[bc].median())
 
-    X = X.dropna()
-    return X
+    return X.dropna()
 
 
 # ======================================================================
@@ -184,9 +186,18 @@ def main():
         st.info("Choose a player and click 'Get Predictions Now'")
         return
 
-    year = datetime.date.today().year
-    season_str = f"{year-1}-{str(year)[-2:]}"
+    # ================================
+    # USE 2025–2026 SEASON FIRST
+    # ================================
+    season_str = "2025-26"
+
     logs = dfetch.get_player_game_logs_nba(player_id, season_str)
+
+    if logs.empty():
+        st.warning("2025–26 season not found, falling back to current season")
+        year = datetime.date.today().year
+        fallback_season = f"{year-1}-{str(year)[-2:]}"
+        logs = dfetch.get_player_game_logs_nba(player_id, fallback_season)
 
     if logs.empty:
         st.error("No game logs found.")
@@ -200,19 +211,28 @@ def main():
 
         df_local = df.copy()
 
+        # build TARGET safely (1D)
         if isinstance(PROP_MAP[stat], list):
             df_local["TARGET"] = df_local[PROP_MAP[stat]].sum(axis=1)
         else:
             df_local["TARGET"] = df_local[PROP_MAP[stat]]
 
+        # enforce numeric 1D
+        df_local["TARGET"] = pd.to_numeric(df_local["TARGET"], errors="coerce")
+        df_local["TARGET"] = df_local["TARGET"].astype(float)
+        df_local["TARGET"] = df_local["TARGET"].squeeze()
+
         y = df_local["TARGET"]
 
+        # build custom features
         X = build_features_for_stat(df_local, stat)
 
+        # align
         df_final = pd.concat([y, X], axis=1).dropna()
         y_final = df_final["TARGET"]
         X_final = df_final.drop(columns=["TARGET"])
 
+        # train or load cached model
         manager = get_cached_model(player_id, stat, X_final, y_final)
 
         X_next = X_final.tail(1)
