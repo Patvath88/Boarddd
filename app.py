@@ -1,14 +1,11 @@
 """
-NBA Prop Predictor — Pro Tier
-Auto-predicts ALL NBA props using custom feature selection per-stat,
-individually cached models, and multi-model ML ensemble.
-
-Stats predicted:
-- Points, Rebounds, Assists
-- PRA, PR, PA, RA
-- 3PM
-- Steals, Blocks, Turnovers
-- Minutes
+NBA Prop Predictor — Pro Tier (Final Build)
+Predicts ALL NBA props for a selected player using:
+- Per-stat custom feature sets
+- Cached models for instant predictions
+- Multi-model ML ensemble (Linear, RF, XGB, etc.)
+- Automatic best-model selection per stat
+- Detailed MAE/MSE reporting
 """
 
 from __future__ import annotations
@@ -21,9 +18,9 @@ import data_fetching as dfetch
 from models import ModelManager
 
 
-###############################################################################
+# ======================================================================
 # PROP DEFINITIONS
-###############################################################################
+# ======================================================================
 
 PROP_MAP = {
     "Points": "PTS",
@@ -43,9 +40,9 @@ PROP_MAP = {
 STAT_COLUMNS = ["PTS","REB","AST","STL","BLK","TOV","FG3M","MIN"]
 
 
-###############################################################################
-# FEATURE ENGINEERING FUNCTIONS
-###############################################################################
+# ======================================================================
+# FEATURE ENGINEERING UTILITIES
+# ======================================================================
 
 def compute_opponent_strength(df):
     opp = df.groupby("OPP_TEAM")[["PTS","REB","AST"]].mean().rename(columns={
@@ -85,85 +82,74 @@ def context_features(df):
     return df
 
 
-###############################################################################
-# CUSTOM FEATURE SELECTION PER-STAT
-###############################################################################
+# ======================================================================
+# CUSTOM FEATURE SET PER PROP STAT
+# ======================================================================
 
 def build_features_for_stat(df, stat):
-    """Return a custom feature matrix X per stat target."""
-
-    BASE_COLS = ["IS_HOME", "REST_DAYS", "BACK_TO_BACK",
-                 "OPP_ALLOW_PTS", "OPP_ALLOW_REB", "OPP_ALLOW_AST"]
-
     df = df.copy()
 
-    # Extract target columns
     if isinstance(PROP_MAP[stat], list):
         cols = PROP_MAP[stat]
     else:
         cols = [PROP_MAP[stat]]
 
-    # Create custom engineered features for each stat
     for col in cols:
         df = lag_features(df, col)
         df = rolling_features(df, col)
         df = trend_feature(df, col)
 
-    # Build feature matrix
-    IGNORE = [
-        "GAME_DATE", "MATCHUP", "SEASON_ID", "TEAM_ABBREVIATION",
-        "WL", "VIDEO_AVAILABLE", "OPP_TEAM",
+    base_cols = ["IS_HOME","REST_DAYS","BACK_TO_BACK",
+                 "OPP_ALLOW_PTS","OPP_ALLOW_REB","OPP_ALLOW_AST"]
+
+    ignore = [
+        "GAME_DATE","MATCHUP","SEASON_ID","TEAM_ABBREVIATION",
+        "WL","VIDEO_AVAILABLE","OPP_TEAM"
     ]
 
-    X = df.drop(columns=IGNORE, errors="ignore")
-
-    # Keep only numeric columns
+    X = df.drop(columns=ignore, errors="ignore")
     X = X.select_dtypes(include=["float","int"])
 
-    # Add base columns (fill missing)
-    for bc in BASE_COLS:
+    for bc in base_cols:
         if bc in df.columns:
             X[bc] = df[bc].fillna(df[bc].median())
 
-    # Drop NaN introduced by rolling / trend
-    X = X.dropna(axis=0)
-
+    X = X.dropna()
     return X
 
 
-###############################################################################
-# DATASET CONSTRUCTION
-###############################################################################
+# ======================================================================
+# DATASET BUILDER
+# ======================================================================
 
-def build_training_dataset(game_logs):
-    if game_logs.empty:
+def build_training_dataset(logs):
+    if logs.empty:
         return pd.DataFrame()
 
-    df = game_logs.copy()
+    df = logs.copy()
     df["OPP_TEAM"] = df["MATCHUP"].str.extract(r"(?:vs\.|@)\s(.+)$")
+
     df = compute_opponent_strength(df)
     df = context_features(df)
 
-    # Remove any invalid rows early
     df = df.dropna(subset=["PTS","REB","AST"])
     return df.reset_index(drop=True)
 
 
-###############################################################################
-# CACHING — Train Once Per Player Per Stat
-###############################################################################
+# ======================================================================
+# MODEL CACHE — one model per stat per player
+# ======================================================================
 
 @st.cache_resource
 def get_cached_model(player_id, stat, X, y):
-    """Train and cache a model specifically for this player & stat."""
     manager = ModelManager(random_state=42)
     manager.train(X, y)
     return manager
 
 
-###############################################################################
-# PLAYER LIST CACHE
-###############################################################################
+# ======================================================================
+# PLAYER LIST
+# ======================================================================
 
 @st.cache_data(show_spinner=False)
 def load_player_list():
@@ -178,32 +164,29 @@ def load_player_list():
         return fallback[["id","full_name","team_id"]]
 
 
-###############################################################################
+# ======================================================================
 # MAIN APP
-###############################################################################
+# ======================================================================
 
 def main():
     st.set_page_config(page_title="NBA Prop Predictor Pro", page_icon="🏀", layout="wide")
-    st.title("NBA Prop Predictor — Pro Tier")
-    st.caption("Automatically predicts ALL NBA props for a selected player.")
+    st.title("NBA Prop Predictor — Full Auto-Prop Mode")
 
     players = load_player_list()
 
     with st.sidebar:
         name = st.selectbox("Select Player", players["full_name"])
-        selected = players[players["full_name"] == name].iloc[0]
-        player_id = int(selected["id"])
-
-        run = st.button("Get Prediction Now")
+        row = players[players["full_name"] == name].iloc[0]
+        player_id = int(row["id"])
+        run = st.button("Get Predictions Now")
 
     if not run:
-        st.info("Choose a player and click 'Get Prediction Now'")
+        st.info("Choose a player and click 'Get Predictions Now'")
         return
 
-    # Fetch data
     year = datetime.date.today().year
-    season = f"{year-1}-{str(year)[-2:]}"
-    logs = dfetch.get_player_game_logs_nba(player_id, season)
+    season_str = f"{year-1}-{str(year)[-2:]}"
+    logs = dfetch.get_player_game_logs_nba(player_id, season_str)
 
     if logs.empty:
         st.error("No game logs found.")
@@ -213,15 +196,10 @@ def main():
 
     results = []
 
-    # ================================
-    # PREDICT ALL PROPS
-    # ================================
     for stat in PROP_MAP.keys():
 
-        y = None
         df_local = df.copy()
 
-        # Build stat-target
         if isinstance(PROP_MAP[stat], list):
             df_local["TARGET"] = df_local[PROP_MAP[stat]].sum(axis=1)
         else:
@@ -229,20 +207,16 @@ def main():
 
         y = df_local["TARGET"]
 
-        # Build features for this stat
         X = build_features_for_stat(df_local, stat)
 
-        # Align target and features
         df_final = pd.concat([y, X], axis=1).dropna()
         y_final = df_final["TARGET"]
         X_final = df_final.drop(columns=["TARGET"])
 
-        # Get cached model
         manager = get_cached_model(player_id, stat, X_final, y_final)
 
-        # Predict next row (last sample)
         X_next = X_final.tail(1)
-        preds = manager.predict(X_next)
+        predictions = manager.predict(X_next)
         best = manager.best_model()
 
         results.append({
@@ -253,14 +227,13 @@ def main():
             "MSE": best.mse
         })
 
-    # Display results table
     st.subheader("Predicted Props")
     st.dataframe(pd.DataFrame(results), use_container_width=True)
 
     st.subheader("Recent Games")
     st.dataframe(
-        logs[["GAME_DATE","MATCHUP","PTS","REB","AST","FG3M",
-              "STL","BLK","TOV","MIN"]],
+        logs[["GAME_DATE","MATCHUP","PTS","REB","AST",
+              "FG3M","STL","BLK","TOV","MIN"]],
         use_container_width=True
     )
 
