@@ -1,14 +1,15 @@
 # app.py
 """
-NBA Prop Predictor — Elite (User-facing)
-- Projections only (no ML details in UI)
-- Predict, Favorites, Research (any player, full-history insights)
-- Auto opponent; Defense & Pace features (hidden under the hood)
-- Team logo & name, next opponent with EST date/time
-- Animated basketball loader; team-colored projection cards
-- Stable box-score order across cards/tables/charts
-- Blank selectboxes by default on every page
-- Trading-card style share image sized for mobile (1080x1920)
+NBA Prop Predictor — Elite
+- Projections-only UI (ML hidden)
+- Predict, Favorites, Research
+- Auto opponent; Defense & Pace features
+- Team logo, next opponent EST
+- Animated loader; team-colored metric cards
+- Blank selects; stable box-score order
+- Trading-card share image (mobile 1080x1920) with large fonts
+- Favorites: higher contrast, larger headshots, 3 per row
+- Share buttons on Predict, Favorites, Research
 """
 
 from __future__ import annotations
@@ -56,7 +57,6 @@ PROP_MAP = {
 }
 STAT_COLUMNS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "MIN"]
 
-# Fixed box-score order
 BOX_SCORE_ORDER = [
     "Points", "Rebounds", "Assists", "3PM", "Steals", "Blocks", "Turnovers", "Minutes",
     "PRA", "PR", "PA", "RA",
@@ -80,7 +80,7 @@ FAV_FILE = DATA_DIR / "favorites.json"
 
 
 # =============================================================================
-# TEAM META (colors + NBA logo ids)
+# TEAM META
 # =============================================================================
 
 TEAM_META: Dict[str, Dict[str, str | int]] = {
@@ -125,7 +125,7 @@ def nba_logo_url(team_abbr: str) -> Optional[str]:
 
 
 # =============================================================================
-# STYLING + ANIMATIONS
+# STYLING
 # =============================================================================
 
 def inject_css() -> None:
@@ -139,12 +139,9 @@ h1, h2, h3, h4 {
   -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   animation: fadeIn 700ms ease both;
 }
-
-/* Global animations */
 @keyframes fadeIn { from {opacity:0; transform: translateY(6px)} to {opacity:1; transform:none} }
 @keyframes rise { from {opacity:.0; transform: translateY(12px)} to {opacity:1; transform:none} }
 
-/* Cards */
 .card {
   background: rgba(17,24,39,.6);
   border: 1px solid rgba(255,255,255,.08);
@@ -154,46 +151,41 @@ h1, h2, h3, h4 {
   animation: rise 540ms ease both;
 }
 
-/* Metric grid */
+/* Metric cards */
 .metric-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
 .metric-card {
   border-radius: 16px; padding: 16px 14px; color: #fff; border:1px solid rgba(255,255,255,.10);
   transform-origin: center; animation: rise 480ms ease both;
 }
-.metric-title { font-size:.9rem; opacity:.9; margin-bottom:.35rem; letter-spacing:.25px; }
-.metric-value { font-size:1.9rem; font-weight:800; line-height:1.1; }
+.metric-title { font-size:.95rem; opacity:.95; margin-bottom:.35rem; letter-spacing:.25px; }
+.metric-value { font-size:2.1rem; font-weight:800; line-height:1.1; }
 
-/* Favorites improved layout */
+/* Favorites — higher contrast, bigger headshots */
 .fav-box {
-  background: radial-gradient(1200px 500px at -10% -40%, rgba(59,130,246,.15), transparent 45%),
-              radial-gradient(900px 420px at 120% 10%, rgba(16,185,129,.12), transparent 40%),
-              #0b1220;
-  border: 1px solid rgba(255,255,255,.08);
+  background: linear-gradient(180deg, #0b1220 0%, #0a1324 100%);
+  border: 1px solid rgba(255,255,255,.10);
   border-radius: 16px;
   padding: 12px 14px;
   box-shadow: 0 12px 34px rgba(0,0,0,.28);
   animation: rise 420ms ease both;
 }
-.fav-name { font-weight: 700; color: #e5e7eb; line-height: 1.2; }
-.fav-meta { font-size: .9rem; color: #cbd5e1; }
+.fav-name { font-weight: 800; color: #f3f4f6; line-height: 1.2; font-size: 1.05rem; }
+.fav-meta { font-size: .92rem; color: #d1d5db; }
 .fav-x > button {
-  background: transparent !important; color: #ef4444 !important; border: 1px solid #ef4444 !important;
-  border-radius: 10px !important; padding: 2px 8px !important; font-weight: 800 !important;
+  background: #111827 !important; color: #ef4444 !important; border: 1px solid #ef4444 !important;
+  border-radius: 10px !important; padding: 4px 10px !important; font-weight: 800 !important;
 }
 .fav-x > button:hover { filter: brightness(1.15); }
 
-/* Buttons */
 .stButton>button { border-radius: 12px; padding: 10px 14px; font-weight: 600;
   background: linear-gradient(90deg,#0ea5e9,#22c55e); border: none; }
 .stButton>button:hover { filter: brightness(1.05); }
 
-/* Tag/badge */
 .tag { display:inline-block; padding:.2rem .55rem; border-radius:999px; font-size:.75rem;
   background:rgba(99,102,241,.15); border:1px solid rgba(99,102,241,.35); }
 .badge { display:inline-block; padding:.25rem .6rem; border-radius:10px; font-size:.8rem;
   background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#d1fae5; }
 
-/* DataFrame wrap */
 [data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); }
 
 /* Basketball Loader */
@@ -223,7 +215,7 @@ h1, h2, h3, h4 {
 
 
 # =============================================================================
-# UTILITIES
+# UTILS
 # =============================================================================
 
 def _rerun():
@@ -287,7 +279,7 @@ def order_results(results: List[Dict]) -> List[Dict]:
 
 
 # =============================================================================
-# PERSISTENCE (favorites)
+# PERSISTENCE
 # =============================================================================
 
 def _load_favorites() -> List[dict]:
@@ -335,13 +327,13 @@ def _safe_image_from_bytes(photo_bytes: Optional[bytes], size=(220, 220)) -> Ima
     except Exception:
         return Image.new("RGB", size, (15, 23, 42))
 
-def default_placeholder_bytes(size=(42, 42)) -> bytes:
+def default_placeholder_bytes(size=(64, 64)) -> bytes:
     img = Image.new("RGB", size, (17, 26, 45))
     d = ImageDraw.Draw(img)
     d.rectangle([6, 6, size[0]-6, size[1]-6], outline=(90, 100, 120), width=2)
     buf = io.BytesIO(); img.save(buf, format="PNG"); return buf.getvalue()
 
-def get_logo_or_default(team_abbr: str) -> bytes:
+def get_logo_or_default(team_abbr: str, size=(64, 64)) -> bytes:
     url = nba_logo_url(team_abbr)
     if url:
         try:
@@ -350,7 +342,7 @@ def get_logo_or_default(team_abbr: str) -> bytes:
                 return r.content
         except Exception:
             pass
-    return default_placeholder_bytes()
+    return default_placeholder_bytes(size)
 
 def get_photo_or_logo_bytes(fav: dict) -> bytes:
     pid = safe_int(fav.get("id"), 0)
@@ -364,7 +356,7 @@ def get_photo_or_logo_bytes(fav: dict) -> bytes:
 
 
 # =============================================================================
-# TEAMS / PLAYERS (robust)
+# TEAMS / PLAYERS
 # =============================================================================
 
 @st.cache_data(show_spinner=False)
@@ -568,7 +560,7 @@ def load_logs(player_id: int, season: str) -> pd.DataFrame:
 
 
 # =============================================================================
-# OPPONENT DEFENSE & PACE (Balldontlie)
+# OPPONENT DEFENSE & PACE
 # =============================================================================
 
 def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
@@ -612,7 +604,6 @@ def load_team_defense_pace(season: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
-    """Return next game info with UTC & EST times."""
     if not team_id or int(team_id) <= 0: return None
     year = season_start_year(season)
     today = dt.date.today().isoformat()
@@ -626,7 +617,7 @@ def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
         j = r.json(); data = j.get("data", [])
         if not data: return None
 
-        def _dt(game):  # parse as aware UTC
+        def _dt(game):
             ds = game["date"]
             return dt.datetime.fromisoformat(ds.replace("Z", "+00:00"))
 
@@ -651,7 +642,7 @@ def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
 
 
 # =============================================================================
-# FEATURE ENGINEERING (hidden)
+# FEATURE ENGINEERING
 # =============================================================================
 
 def compute_opponent_strength(df: pd.DataFrame) -> pd.DataFrame:
@@ -736,16 +727,15 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# MODELING (hidden; still used under the hood)
+# MODELING
 # =============================================================================
 
 def _apply_model_budget(manager: ModelManager, budget: str) -> None:
-    # Hidden: we default to "Single" (ElasticNet) for speed
     if budget == "Full ensemble":
         return
     if budget == "Lite (3 models)":
         wanted = {"elasticnet","hgb","stack"}
-    else:  # "Single (Lasso)" → map to ElasticNet internally
+    else:
         wanted = {"elasticnet"}
     try:
         if hasattr(manager, "set_model_whitelist"):
@@ -810,8 +800,23 @@ def train_predict_for_stat(
 
 
 # =============================================================================
-# TABLE/CSV + CHARTS + SHARE + CARDS
+# SHARE IMAGES & UI HELPERS
 # =============================================================================
+
+def get_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Try DejaVuSans/Arial for crisp large type; fallback to default."""
+    paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+    ]
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 def results_to_table(results: List[Dict]) -> pd.DataFrame:
     ordered = order_results(results)
@@ -848,7 +853,7 @@ def render_metric_cards(results: List[Dict], team_color: str) -> None:
     html.append("</div>")
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
-# --- New: trading-card style share image (mobile 1080x1920) ---
+# Trading-card share (mobile 1080×1920) with large fonts
 def make_share_image_trading_card(
     player_name: str,
     team_abbr: str,
@@ -859,76 +864,73 @@ def make_share_image_trading_card(
     photo_bytes: Optional[bytes],
     logo_bytes: Optional[bytes],
     df_table: pd.DataFrame,
+    title_suffix: str = "Projections",
 ) -> bytes:
     W, H = 1080, 1920
     base_col = team_color.lstrip("#") if team_color else "60a5fa"
     r = int(base_col[0:2], 16); g = int(base_col[2:4], 16); b = int(base_col[4:6], 16)
 
-    bg = Image.new("RGB", (W, H), color=(10, 14, 24))
+    bg = Image.new("RGB", (W, H), color=(8, 12, 22))
     overlay = Image.new("RGB", (W, H), (r, g, b))
-    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=180))
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=210))
     bg = Image.blend(bg, overlay, alpha=0.22)
 
     draw = ImageDraw.Draw(bg)
-    # Header "foil" stripe
-    draw.rectangle([0, 0, W, 160], fill=(20, 24, 38))
-    draw.line([(0, 160), (W, 160)], fill=(255, 255, 255, 40), width=1)
+    # Header band
+    draw.rectangle([0, 0, W, 180], fill=(20, 26, 40))
+    draw.line([(0, 180), (W, 180)], fill=(255, 255, 255, 44), width=1)
 
-    # Team logo circle
+    # Logo
     if logo_bytes:
         try:
-            logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA").resize((120, 120))
+            logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA").resize((128, 128))
+            bg.paste(logo, (48, 26), logo)
         except Exception:
-            logo = None
-    else:
-        logo = None
-    if logo:
-        bg.paste(logo, (40, 20), mask=logo if logo.mode == "RGBA" else None)
+            pass
 
-    # Player portrait in circle
-    head = _safe_image_from_bytes(photo_bytes, size=(520, 520)).convert("RGBA")
-    mask = Image.new("L", (520, 520), 0); mdraw = ImageDraw.Draw(mask); mdraw.ellipse((0, 0, 520, 520), fill=255)
+    # Portrait (big circle)
+    head = _safe_image_from_bytes(photo_bytes, size=(540, 540)).convert("RGBA")
+    mask = Image.new("L", (540, 540), 0); mdraw = ImageDraw.Draw(mask); mdraw.ellipse((0, 0, 540, 540), fill=255)
     head.putalpha(mask)
-    bg.paste(head, (280, 140), mask=head)
+    bg.paste(head, (270, 160), head)
+
+    # Fonts (larger)
+    f_title = get_font(64)
+    f_sub = get_font(36)
+    f_small = get_font(30)
+    f_metric = get_font(80)
+    f_metric_title = get_font(36)
 
     # Card container
-    card = Image.new("RGBA", (980, 1020), (20, 26, 40, 240))
+    card = Image.new("RGBA", (980, 1080), (16, 22, 36, 245))
     cd = ImageDraw.Draw(card)
-    cd.rounded_rectangle([0, 0, 980, 1020], radius=32, outline=(255, 255, 255, 35), width=2)
-    # Title area
-    cd.rectangle([0, 0, 980, 120], fill=(r, g, b, 230))
-    # Fonts
-    font_big = ImageFont.load_default()
-    font_med = ImageFont.load_default()
-    font_sm = ImageFont.load_default()
+    cd.rounded_rectangle([0, 0, 980, 1080], radius=34, outline=(255, 255, 255, 50), width=2)
+    cd.rectangle([0, 0, 980, 140], fill=(r, g, b, 235))
 
     # Titles
-    cd.text((24, 20), f"{player_name}", fill=(255, 255, 255), font=font_big)
-    cd.text((24, 60), f"{team_name} ({team_abbr})  •  {season}", fill=(240, 244, 255), font=font_med)
-    cd.text((24, 96), next_info, fill=(220, 228, 245), font=font_sm)
+    cd.text((28, 24), f"{player_name}", fill=(255, 255, 255), font=f_title)
+    cd.text((28, 86), f"{team_name} ({team_abbr})  •  {season}  •  {title_suffix}", fill=(245, 248, 255), font=f_sub)
+    cd.text((28, 120), next_info, fill=(225, 232, 247), font=f_small)
 
-    # Metric cards (2 columns)
-    stats_show = [s for s in BOX_SCORE_ORDER if s in df_table["Stat"].tolist()]
-    stats_show = stats_show[:8]  # top 8 for a clean mobile view
+    # Metric tiles (2×4)
+    stats_show = [s for s in BOX_SCORE_ORDER if s in df_table["Stat"].tolist()][:8]
     grid = []
     for s in stats_show:
         val = df_table[df_table["Stat"] == s]["Pred"].values
         pred = f"{float(val[0]):.1f}" if len(val) else "—"
         grid.append((s, pred))
 
-    # Draw mini metric rectangles
-    x0, y0 = 40, 180
-    w, h = 420, 150
-    gap_x, gap_y = 40, 28
+    x0, y0 = 40, 190
+    w, h = 430, 170
+    gap_x, gap_y = 40, 34
     for i, (s, pred) in enumerate(grid):
         cx = x0 + (i % 2) * (w + gap_x)
         cy = y0 + (i // 2) * (h + gap_y)
-        cd.rounded_rectangle([cx, cy, cx + w, cy + h], radius=18, fill=(14, 18, 30, 255), outline=(255, 255, 255, 30), width=2)
-        cd.text((cx + 16, cy + 14), s, fill=(210, 220, 245), font=font_med)
-        cd.text((cx + 16, cy + 64), pred, fill=(255, 255, 255), font=font_big)
+        cd.rounded_rectangle([cx, cy, cx + w, cy + h], radius=20, fill=(12, 16, 28, 255), outline=(255, 255, 255, 34), width=2)
+        cd.text((cx + 18, cy + 16), s, fill=(208, 218, 242), font=f_metric_title)
+        cd.text((cx + 18, cy + 72), pred, fill=(255, 255, 255), font=f_metric)
 
-    bg.paste(card, (50, 700), card)
-
+    bg.paste(card, (50, 720), card)
     buf = io.BytesIO(); bg.save(buf, format="PNG", optimize=True); return buf.getvalue()
 
 def bar_chart_from_table(df: pd.DataFrame, title: str, color: str | None = None):
@@ -1001,9 +1003,8 @@ def page_predict(players: pd.DataFrame):
         team_name = team_meta.get("name", team_abbr or "")
         team_color = team_meta.get("color", "#60a5fa")
         team_logo = nba_logo_url(team_abbr)
-        # Hidden ML settings
         fast_mode = False
-        model_budget = "Single (Lasso)"   # internally mapped to ElasticNet
+        model_budget = "Single (Lasso)"
         run = st.button("Get Projections")
     with col_right:
         nba_pid = None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"), None)
@@ -1052,9 +1053,7 @@ def page_predict(players: pd.DataFrame):
             last_date = pd.to_datetime(features["GAME_DATE"]).max().date()
             next_date = next_game["dt_est"].date() if isinstance(next_game.get("dt_est"), dt.datetime) else next_game.get("date")
             rest_days = max(0, (next_date - last_date).days) if isinstance(next_date, dt.date) else None
-        else:
-            rest_days = None
-        upcoming_ctx["IS_HOME"] = 1 if next_game["is_home"] else 0
+        upcoming_ctx["IS_HOME"] = 1 if next_game and next_game["is_home"] else 0
         if rest_days is not None:
             upcoming_ctx["REST_DAYS"] = rest_days
             upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
@@ -1071,7 +1070,6 @@ def page_predict(players: pd.DataFrame):
         for fut in as_completed(futures): results.append(fut.result())
     load2.empty()
 
-    # Stable order
     results = order_results(results)
 
     st.subheader("Projected Props")
@@ -1081,8 +1079,7 @@ def page_predict(players: pd.DataFrame):
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_projections")
     bar_chart_from_table(df_table, title="Projections (bars)", color=team_color)
 
-    # Share image (trading card)
-    logo_bytes = get_logo_or_default(team_abbr) if team_abbr else None
+    logo_bytes = get_logo_or_default(team_abbr, size=(128,128)) if team_abbr else None
     img_bytes = make_share_image_trading_card(
         player_name=name,
         team_abbr=team_abbr,
@@ -1093,6 +1090,7 @@ def page_predict(players: pd.DataFrame):
         photo_bytes=photo,
         logo_bytes=logo_bytes,
         df_table=df_table[["Stat","Pred"]],
+        title_suffix="Projections",
     )
     st.download_button("📸 Share image (PNG, mobile)", data=img_bytes, file_name=f"{name.replace(' ','_')}_{season}_card.png", mime="image/png")
 
@@ -1141,28 +1139,26 @@ def page_favorites(players: pd.DataFrame):
 
     if favs:
         st.subheader("Saved favorites")
-        # Render clean 3-col grid, each card with: image | name/meta | delete
         cols = st.columns(3)
         for i, f in enumerate(list(favs)):
             with cols[i % 3]:
-                with st.container(border=False):
-                    st.markdown('<div class="fav-box">', unsafe_allow_html=True)
-                    c1, c2, c3 = st.columns([1, 5, 1])
-                    with c1:
-                        img_bytes = get_photo_or_logo_bytes(f)
-                        st.image(Image.open(io.BytesIO(img_bytes)).resize((48, 48)), use_column_width=False)
-                    with c2:
-                        abbr = safe_str(f.get("team_abbr"), "")
-                        st.markdown(f"<div class='fav-name'>{safe_str(f.get('full_name'),'')}</div>", unsafe_allow_html=True)
-                        st.markdown(f"<div class='fav-meta'>{abbr}</div>", unsafe_allow_html=True)
-                    with c3:
-                        st.markdown("<div class='fav-x'>", unsafe_allow_html=True)
-                        if st.button("❌", key=f"del_{safe_int(f.get('id'),0)}", help="Remove from favorites"):
-                            favs = [x for x in favs if safe_int(x.get("id"),0) != safe_int(f.get("id"),0)]
-                            _save_favorites(favs)
-                            _rerun()
-                        st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown('<div class="fav-box">', unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([1, 5, 1])
+                with c1:
+                    img_bytes = get_photo_or_logo_bytes(f)
+                    st.image(Image.open(io.BytesIO(img_bytes)).resize((72, 72)), use_column_width=False)
+                with c2:
+                    abbr = safe_str(f.get("team_abbr"), "")
+                    st.markdown(f"<div class='fav-name'>{safe_str(f.get('full_name'),'')}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='fav-meta'>{abbr}</div>", unsafe_allow_html=True)
+                with c3:
+                    st.markdown("<div class='fav-x'>", unsafe_allow_html=True)
+                    if st.button("❌", key=f"del_{safe_int(f.get('id'),0)}", help="Remove from favorites"):
+                        favs = [x for x in favs if safe_int(x.get("id"),0) != safe_int(f.get("id"),0)]
+                        _save_favorites(favs)
+                        _rerun()
                     st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.info("No favorites yet.")
 
@@ -1237,7 +1233,10 @@ def page_favorites(players: pd.DataFrame):
 
         photo = get_player_photo_bytes(pid, nba_pid)
         next_info = _format_next_info(next_game, rest_days if next_game else None)
-        logo_bytes = get_logo_or_default(abbr) if abbr else None
+        logo_bytes = get_logo_or_default(abbr, size=(128,128)) if abbr else None
+        table_small = df_table[["Stat","Projection" if "Projection" in df_table.columns else "Pred"]].copy()
+        if "Projection" in table_small.columns:
+            table_small = table_small.rename(columns={"Projection": "Pred"})
         share_bytes = make_share_image_trading_card(
             player_name=pname,
             team_abbr=abbr,
@@ -1247,9 +1246,11 @@ def page_favorites(players: pd.DataFrame):
             next_info=next_info,
             photo_bytes=photo,
             logo_bytes=logo_bytes,
-            df_table=df_table[["Stat","Pred"]],
+            df_table=table_small,
+            title_suffix="Projections",
         )
         share_images.append((f"{pname.replace(' ','_')}_{season}.png", share_bytes))
+        st.download_button("📸 Share image (PNG, mobile)", data=share_bytes, file_name=f"{pname.replace(' ','_')}_{season}_card.png", mime="image/png")
 
         progress.progress((i+1)/len(favs))
 
@@ -1265,11 +1266,11 @@ def page_favorites(players: pd.DataFrame):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for fname, content in share_images: z.writestr(fname, content)
-        st.download_button("📦 Download share images (ZIP)", data=buf.getvalue(), file_name=f"favorites_{season}_share_images.zip", mime="application/zip")
+        st.download_button("📦 Download all share images (ZIP)", data=buf.getvalue(), file_name=f"favorites_{season}_share_images.zip", mime="application/zip")
 
 
 # =============================================================================
-# PAGES — RESEARCH (recent & windows)
+# PAGES — RESEARCH
 # =============================================================================
 
 def _season_strings(start_year: int = 2000, end_year: Optional[int] = None) -> List[str]:
@@ -1314,32 +1315,26 @@ def _season_from_date(date_val: dt.date) -> str:
     return f"{y-1}-{str(y)[-2:]}"
 
 def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
-    """Render trends & averages charts for a window; robust to missing stats."""
     if df_w is None or df_w.empty or "GAME_DATE" not in df_w.columns:
         return
-
     value_cols = [c for c in ["PTS", "REB", "AST"] if c in df_w.columns]
     if not value_cols:
         st.info("No chartable stats available for this window.")
         return
-
     df_w = df_w.copy()
     df_w["GAME_DATE"] = pd.to_datetime(df_w["GAME_DATE"], errors="coerce")
     df_w = df_w.dropna(subset=["GAME_DATE"])
     if df_w.empty:
         st.info("No valid dates to chart.")
         return
-
     base = df_w[["GAME_DATE"] + value_cols]
     if base[value_cols].notna().sum().sum() == 0:
         st.info("No numeric values to chart in this window.")
         return
-
     long = base.melt(id_vars=["GAME_DATE"], var_name="Stat", value_name="Val").dropna(subset=["Val"])
     if long.empty:
         st.info("No chartable data after cleaning.")
         return
-
     c_line = (
         alt.Chart(long)
         .mark_line()
@@ -1352,7 +1347,6 @@ def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
         .properties(height=220, title=f"{title_prefix} — Trends (PTS/REB/AST)")
     )
     st.altair_chart(c_line, use_container_width=True)
-
     avg_long = long.groupby("Stat", as_index=False)["Val"].mean()
     if not avg_long.empty:
         c_bar = (
@@ -1366,6 +1360,29 @@ def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
             .properties(height=220, title=f"{title_prefix} — Averages")
         )
         st.altair_chart(c_bar, use_container_width=True)
+
+def make_research_share_image_trading_card(
+    player_name: str,
+    team_abbr: str,
+    team_name: str,
+    team_color: str,
+    title_suffix: str,
+    photo_bytes: Optional[bytes],
+    logo_bytes: Optional[bytes],
+    df_metrics: pd.DataFrame,  # Stat, Pred (avg)
+) -> bytes:
+    return make_share_image_trading_card(
+        player_name=player_name,
+        team_abbr=team_abbr,
+        team_name=team_name,
+        team_color=team_color,
+        season=title_suffix,  # reuse slot
+        next_info="Research view",
+        photo_bytes=photo_bytes,
+        logo_bytes=logo_bytes,
+        df_table=df_metrics,
+        title_suffix="Research",
+    )
 
 def page_research():
     st.header("Research")
@@ -1413,7 +1430,6 @@ def page_research():
         st.info("Click **Load player data** to view last game & rolling windows.")
         return
 
-    # Load all seasons
     ph = st.empty(); show_basketball_loader(ph, "Loading game logs across seasons…")
     seasons_all = _season_strings(2000, dt.date.today().year)
     logs = fetch_logs_multi(pid, seasons_all)
@@ -1421,7 +1437,6 @@ def page_research():
     if logs.empty:
         st.warning("No logs found."); return
 
-    # Upcoming opponent (EST) if team_id known
     team_id = safe_int(row.get("team_id"), 0)
     next_game = auto_next_opponent(team_id, seasons_all[-1]) if team_id > 0 else None
     rest_days = None
@@ -1433,14 +1448,12 @@ def page_research():
     badge = _format_next_info(next_game, rest_days)
     st.markdown(f'<span class="badge">{badge}</span>', unsafe_allow_html=True)
 
-    # Most Recent Performance (not an expander)
     st.subheader("Most Recent Performance (Last Game Played)")
     lg = logs.copy().sort_values("GAME_DATE")
     last = lg.tail(1)
     cols_show = [c for c in ["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in last.columns]
     st.dataframe(last[cols_show], use_container_width=True, hide_index=True)
 
-    # Rolling windows
     def _section(label: str, n: int):
         w, avg = _window_avg(lg, n)
         st.markdown(f"### {label} Averages")
@@ -1457,14 +1470,12 @@ def page_research():
     _section("Last 10 Games", 10)
     _section("Last 20 Games", 20)
 
-    # Current & Past Season
     if lg["GAME_DATE"].notna().any():
         last_date = pd.to_datetime(lg["GAME_DATE"]).max().date()
         cur_season = _season_from_date(last_date)
         prev_sea = prev_season(cur_season)
     else:
-        seasons_all_sorted = seasons_all
-        cur_season = seasons_all_sorted[-1]; prev_sea = seasons_all_sorted[-2] if len(seasons_all_sorted) > 1 else cur_season
+        cur_season = seasons_all[-1]; prev_sea = seasons_all[-2] if len(seasons_all) > 1 else cur_season
 
     def _season_avg_block(title: str, season_str: str):
         df_s = lg[lg["SEASON"] == season_str].copy()
@@ -1482,7 +1493,6 @@ def page_research():
     _season_avg_block("Current Season Averages", cur_season)
     _season_avg_block("Past Season Averages", prev_sea)
 
-    # Career Averages & Totals
     st.markdown("### Career Averages & Totals")
     if not lg.empty:
         gp = len(lg)
@@ -1516,6 +1526,27 @@ def page_research():
                 tooltip=["SEASON","Stat","Avg","GP"]
             ).properties(height=220, title="Per-season Averages").resolve_scale(y='independent')
             st.altair_chart(c2, use_container_width=True)
+
+    # Research share image button (use L10 averages)
+    w10, avg10 = _window_avg(lg, 10)
+    if not avg10.empty:
+        table = avg10.T.reset_index().rename(columns={"index":"Stat","Avg":"Pred"})
+        table["Stat"] = table["Stat"].map({
+            "PTS":"Points","REB":"Rebounds","AST":"Assists","FG3M":"3PM","STL":"Steals","BLK":"Blocks","TOV":"Turnovers","MIN":"Minutes"
+        })
+        table = table.dropna().reset_index(drop=True)
+        logo_bytes = get_logo_or_default(abbr, size=(128,128)) if abbr else None
+        share_bytes = make_research_share_image_trading_card(
+            player_name=name,
+            team_abbr=abbr,
+            team_name=team_name,
+            team_color=color,
+            title_suffix="L10 Averages",
+            photo_bytes=photo,
+            logo_bytes=logo_bytes,
+            df_metrics=table[["Stat","Pred"]],
+        )
+        st.download_button("📸 Share image (PNG, mobile)", data=share_bytes, file_name=f"{name.replace(' ','_')}_research_card.png", mime="image/png")
 
 
 # =============================================================================
