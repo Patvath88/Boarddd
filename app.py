@@ -289,7 +289,7 @@ def main():
                 "MIN",
             ]
         ],
-        use_container_width=True,
+         width='stretch',
     )
 
 
