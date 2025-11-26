@@ -1,11 +1,10 @@
 # app.py
 """
 NBA Prop Predictor — Elite (Predict & Favorites only)
-- Fix: pd.NA truthiness crash via safe_int/safe_str helpers (no more NAType.__bool__)
-- Robust active-player loader + Refresh cache
-- Auto next opponent; DEF_Z, PACE_Z, DEF×PACE
-- Photos/logos, copyable table + CSV, shareable PNG, per-stat bar charts
-- Favorites with glow cards and ❌ removal
+- Animated basketball loaders; polished theme & card animations
+- Team-colored metric cards with prop label, predicted value, model, and confidence %
+- Robust player loading; Auto opponent; DEF_Z/ PACE_Z/ DEF×PACE
+- Favorites with glow cards and ❌
 - Model budget control (Full / Lite 3 models / Single)
 """
 
@@ -117,7 +116,7 @@ def nba_logo_url(team_abbr: str) -> Optional[str]:
 
 
 # =============================================================================
-# STYLING
+# STYLING + ANIMATIONS
 # =============================================================================
 
 def inject_css() -> None:
@@ -125,38 +124,88 @@ def inject_css() -> None:
         """
 <style>
 html, body { font-family: Inter, ui-sans-serif, system-ui; }
-.block-container { padding-top: 1.2rem; max-width: 1240px; }
+.block-container { padding-top: 1.1rem; max-width: 1240px; }
 h1, h2, h3, h4 {
   background: linear-gradient(90deg,#e2e8f0 0%, #60a5fa 40%, #34d399 100%);
   -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  animation: fadeIn 700ms ease both;
 }
-.card {
-  background: rgba(17, 24, 39, 0.6);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
-  padding: 18px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.25);
-  backdrop-filter: blur(6px);
-}
-.stButton>button {
-  border-radius: 12px; padding: 10px 14px; font-weight: 600;
-  background: linear-gradient(90deg,#0ea5e9,#22c55e); border: none;
-}
-.stButton>button:hover { filter: brightness(1.05); }
-.tag {
-  display:inline-block; padding:.2rem .55rem; border-radius:999px; font-size:.75rem;
-  background:rgba(99,102,241,.15); border:1px solid rgba(99,102,241,.35);
-}
-.badge { display:inline-block; padding:.25rem .6rem; border-radius:10px; font-size:.8rem;
-  background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#d1fae5; }
-[data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); }
 
-/* favorites grid */
+/* Global animations */
+@keyframes fadeIn { from {opacity:0; transform: translateY(6px)} to {opacity:1; transform:none} }
+@keyframes rise { from {opacity:.0; transform: translateY(12px)} to {opacity:1; transform:none} }
+@keyframes pulseGlow { 0%,100%{box-shadow:0 0 0 rgba(255,255,255,0)} 50%{box-shadow:0 0 28px rgba(255,255,255,.08)} }
+
+/* Cards */
+.card {
+  background: rgba(17,24,39,.6);
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 16px; padding: 18px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+  backdrop-filter: blur(6px);
+  animation: rise 540ms ease both;
+}
+
+/* Metric grid */
+.metric-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+.metric-card {
+  border-radius: 16px; padding: 16px 14px; color: #fff; border:1px solid rgba(255,255,255,.10);
+  transform-origin: center; animation: rise 480ms ease both;
+}
+.metric-title { font-size:.9rem; opacity:.9; margin-bottom:.35rem; letter-spacing:.25px; }
+.metric-value { font-size:1.9rem; font-weight:800; line-height:1.1; }
+.metric-sub { font-size:.82rem; opacity:.9; margin-top:.2rem }
+.metric-chip { display:inline-block; font-size:.72rem; padding:.2rem .5rem; border-radius: 999px; background: rgba(255,255,255,.12); margin-left:.35rem; }
+
+/* Favorites grid */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
-.glow-card { padding: 14px; border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: #0b1220; }
+.glow-card { padding: 14px; border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: #0b1220; animation: rise 420ms ease both; }
 .glow-hdr { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 .glow-name { font-weight: 700; color: #e5e7eb; }
 .glow-meta { font-size: .9rem; color: #cbd5e1; }
+
+/* Buttons */
+.stButton>button { border-radius: 12px; padding: 10px 14px; font-weight: 600;
+  background: linear-gradient(90deg,#0ea5e9,#22c55e); border: none; }
+.stButton>button:hover { filter: brightness(1.05); }
+
+/* Tag/badge */
+.tag { display:inline-block; padding:.2rem .55rem; border-radius:999px; font-size:.75rem;
+  background:rgba(99,102,241,.15); border:1px solid rgba(99,102,241,.35); }
+.badge { display:inline-block; padding:.25rem .6rem; border-radius:10px; font-size:.8rem;
+  background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#d1fae5; }
+
+/* DataFrame wrap */
+[data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); }
+
+/* Basketball Loader */
+.loader-wrap { padding: 10px 0 18px 0; }
+.court {
+  width: 100%; height: 14px; border-radius: 999px; position: relative;
+  background: linear-gradient(90deg, rgba(255,255,255,.08), rgba(255,255,255,.16));
+  overflow: hidden; border: 1px solid rgba(255,255,255,.12);
+}
+.ball {
+  width: 22px; height: 22px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #ffb86b, #d97706 55%, #92400e 100%);
+  position: absolute; top: -4px; left: -22px;
+  box-shadow: inset 0 0 0 2px rgba(0,0,0,.12), 0 6px 14px rgba(0,0,0,.35);
+  animation: dribble 1.6s linear infinite;
+}
+@keyframes dribble {
+  0%   { transform: translateX(0) translateY(0); }
+  10%  { transform: translateX(10%) translateY(2px); }
+  20%  { transform: translateX(20%) translateY(0); }
+  30%  { transform: translateX(30%) translateY(2px); }
+  40%  { transform: translateX(40%) translateY(0); }
+  50%  { transform: translateX(50%) translateY(2px); }
+  60%  { transform: translateX(60%) translateY(0); }
+  70%  { transform: translateX(70%) translateY(2px); }
+  80%  { transform: translateX(80%) translateY(0); }
+  90%  { transform: translateX(90%) translateY(2px); }
+  100% { transform: translateX(110%) translateY(0); }
+}
+.loader-text { color:#cbd5e1; font-size:.9rem; margin-bottom:.35rem; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -174,7 +223,7 @@ def _rerun():
         st.experimental_rerun()
 
 def safe_int(v, default=0) -> int:
-    """Convert to int; treat None/NaN/pd.NA/'' as default. Avoids NAType.__bool__."""
+    # Avoids NAType.__bool__
     try:
         if v is None: return default
         if isinstance(v, str) and v.strip() == "": return default
@@ -184,7 +233,6 @@ def safe_int(v, default=0) -> int:
         return default
 
 def safe_str(v, default="") -> str:
-    """Convert to str; treat None/NaN/pd.NA as default. Avoids NA truthiness."""
     try:
         if v is None: return default
         if pd.isna(v): return default
@@ -373,7 +421,6 @@ def bdl_fetch_active_players_direct() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_player_list(season: str = "2025-26") -> pd.DataFrame:
-    # 1) dfetch primary
     try:
         raw = dfetch.get_active_players_balldontlie()
         p = normalize_players_df(raw)
@@ -381,7 +428,6 @@ def load_player_list(season: str = "2025-26") -> pd.DataFrame:
             return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
     except Exception:
         pass
-    # 2) direct balldontlie fallback
     try:
         raw2 = bdl_fetch_active_players_direct()
         p2 = normalize_players_df(raw2)
@@ -389,7 +435,6 @@ def load_player_list(season: str = "2025-26") -> pd.DataFrame:
             return p2[["id","full_name","team_id","team_abbr","nba_person_id"]]
     except Exception:
         pass
-    # 3) nba.com fallback through dfetch
     try:
         fb = dfetch.get_player_list_nba()
         p3 = normalize_players_df(_filter_active_players(fb, season))
@@ -397,7 +442,6 @@ def load_player_list(season: str = "2025-26") -> pd.DataFrame:
             return p3[["id","full_name","team_id","team_abbr","nba_person_id"]]
     except Exception:
         pass
-    # 4) favorites fallback to avoid empty UI
     favs = _load_favorites()
     if favs:
         p4 = pd.DataFrame(favs)
@@ -596,8 +640,20 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# MODEL TRAINING / PREDICTION
+# CONFIDENCE & MODELING
 # =============================================================================
+
+def _confidence_from_error(mae: float, mse: float, y_scale: float) -> float:
+    # Why: convert errors to an intuitive 0–100 score, higher = better trust
+    if not np.isfinite(y_scale) or y_scale <= 0: y_scale = 1.0
+    rmse = np.sqrt(mse) if np.isfinite(mse) else (mae if np.isfinite(mae) else np.nan)
+    if not np.isfinite(mae) and not np.isfinite(rmse):
+        return 60.0
+    mae = 0.0 if not np.isfinite(mae) else mae
+    rmse = 0.0 if not np.isfinite(rmse) else rmse
+    norm = 0.5 * (mae / y_scale) + 0.5 * (rmse / y_scale)
+    conf = float(np.clip(np.exp(-norm), 0.35, 0.95) * 100.0)
+    return round(conf, 1)
 
 def _apply_model_budget(manager: ModelManager, budget: str) -> None:
     if budget == "Full ensemble": 
@@ -644,13 +700,15 @@ def train_predict_for_stat(
     df_join = pd.concat([pd.Series(y_all, name="TARGET", index=X_all.index), X_all], axis=1)
     df_join = df_join.loc[~df_join["TARGET"].isna()].copy()
     if df_join.empty:
-        return {"Stat": stat, "Prediction": float("nan"), "Best Model": "NoData", "MAE": float("nan"), "MSE": float("nan")}
+        return {"Stat": stat, "Prediction": float("nan"), "Best Model": "NoData", "MAE": float("nan"), "MSE": float("nan"), "Confidence": 50.0, "Scale": 1.0}
 
     y_final = df_join["TARGET"].to_numpy(dtype=float)
     X_final = _impute_features(df_join.drop(columns=["TARGET"]))
     if len(X_final) > N_TRAIN:
         X_final = X_final.iloc[-N_TRAIN:].copy()
         y_final = y_final[-N_TRAIN:].copy()
+
+    y_scale = float(np.nanstd(y_final) or 1.0)
 
     X_next = X_final.tail(1).copy()
     if upcoming_ctx:
@@ -660,20 +718,31 @@ def train_predict_for_stat(
 
     if fast_mode or len(X_final) < MIN_ROWS_FOR_MODEL:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline", "MAE": float("nan"), "MSE": float("nan")}
+        # baseline error vs local mean
+        w = y_final[-10:] if len(y_final) >= 5 else y_final
+        if w.size:
+            m = float(np.nanmean(w))
+            mae_b = float(np.nanmean(np.abs(w - m)))
+            mse_b = float(np.nanmean((w - m) ** 2))
+        else:
+            mae_b = mse_b = np.nan
+        conf = _confidence_from_error(mae_b, mse_b, y_scale)
+        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline", "MAE": mae_b, "MSE": mse_b, "Confidence": conf, "Scale": y_scale}
 
     try:
         manager = get_or_train_model_cached(player_id, season, stat, X_final, y_final, model_budget)
         _ = manager.predict(X_next)
         best = manager.best_model()
-        return {"Stat": stat, "Prediction": float(best.prediction), "Best Model": best.name, "MAE": float(best.mae), "MSE": float(best.mse)}
+        conf = _confidence_from_error(float(best.mae), float(best.mse), y_scale)
+        return {"Stat": stat, "Prediction": float(best.prediction), "Best Model": best.name, "MAE": float(best.mae), "MSE": float(best.mse), "Confidence": conf, "Scale": y_scale}
     except Exception:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(Fallback)", "MAE": float("nan"), "MSE": float("nan")}
+        conf = _confidence_from_error(np.nan, np.nan, y_scale)
+        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(Fallback)", "MAE": float("nan"), "MSE": float("nan"), "Confidence": conf, "Scale": y_scale}
 
 
 # =============================================================================
-# TABLE + CHARTS + SHARE
+# TABLE/CSV + CHARTS + SHARE
 # =============================================================================
 
 def results_to_table(results: List[Dict]) -> pd.DataFrame:
@@ -681,17 +750,45 @@ def results_to_table(results: List[Dict]) -> pd.DataFrame:
     order = {k: i for i, k in enumerate(PROP_MAP.keys())}
     df["__order"] = df["Stat"].map(order)
     df = df.sort_values("__order").drop(columns="__order")
-    df = df.rename(columns={"Stat":"Stat","Prediction":"Pred","Best Model":"Model","MAE":"MAE","MSE":"MSE"})
-    df["Pred"] = pd.to_numeric(df["Pred"], errors="coerce").round(2)
-    df["MAE"]  = pd.to_numeric(df["MAE"],  errors="coerce").round(2)
-    df["MSE"]  = pd.to_numeric(df["MSE"],  errors="coerce").round(2)
-    return df[["Stat","Pred","Model","MAE","MSE"]]
+    df["Pred"] = pd.to_numeric(df["Prediction"], errors="coerce").round(2)
+    df["MAE"]  = pd.to_numeric(df["MAE"], errors="coerce").round(2)
+    df["MSE"]  = pd.to_numeric(df["MSE"], errors="coerce").round(2)
+    df["Confidence"] = pd.to_numeric(df["Confidence"], errors="coerce").round(1)
+    return df[["Stat","Pred","Best Model","MAE","MSE","Confidence"]].rename(columns={"Best Model":"Model"})
 
 def table_downloaders(df: pd.DataFrame, filename_prefix: str) -> None:
     csv = df.to_csv(index=False)
     st.download_button("⬇️ Download CSV", data=csv.encode("utf-8"), file_name=f"{filename_prefix}.csv", mime="text/csv")
     with st.expander("Copy CSV text"):
         st.text_area("CSV", value=csv, height=160)
+
+def lighten_hex(hex_color: str, amount: float = 0.35) -> str:
+    hex_color = hex_color.lstrip("#")
+    try:
+        r = int(hex_color[0:2], 16); g = int(hex_color[2:4], 16); b = int(hex_color[4:6], 16)
+    except Exception:
+        r, g, b = (96, 165, 250)
+    r = int(r + (255 - r) * amount); g = int(g + (255 - g) * amount); b = int(b + (255 - b) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+def render_metric_cards(results: List[Dict], team_color: str) -> None:
+    base = team_color or "#60a5fa"
+    soft = lighten_hex(base, 0.55)
+    html = ['<div class="metric-grid">']
+    for i, r in enumerate(results):
+        stat = str(r["Stat"])
+        pred = f'{float(r["Prediction"]):.2f}' if np.isfinite(r["Prediction"]) else "—"
+        model = safe_str(r.get("Best Model"), "—")
+        conf = r.get("Confidence", 60.0)
+        # Why inline styles: dynamic team color & staggered animation delay
+        html.append(f"""
+<div class="metric-card" style="background: linear-gradient(135deg, {base} 0%, {soft} 95%); animation-delay:{i*0.03:.2f}s">
+  <div class="metric-title">{stat} <span class="metric-chip">{model}</span></div>
+  <div class="metric-value">{pred}</div>
+  <div class="metric-sub">Confidence: {conf:.1f}%</div>
+</div>""")
+    html.append("</div>")
+    st.markdown("\n".join(html), unsafe_allow_html=True)
 
 def make_share_image(player_name: str, season: str, photo_bytes: Optional[bytes], table_df: pd.DataFrame, next_info: str) -> bytes:
     W, H = 1200, 675
@@ -722,9 +819,17 @@ def bar_chart_from_table(df: pd.DataFrame, title: str, color: str | None = None)
     c = alt.Chart(df).mark_bar(color=color).encode(
         x=alt.X("Stat:N", sort=df["Stat"].tolist()),
         y=alt.Y("Pred:Q"),
-        tooltip=["Stat","Pred","Model","MAE","MSE"],
+        tooltip=["Stat","Pred","Model","MAE","MSE","Confidence"],
     ).properties(height=280, title=title)
     st.altair_chart(c, use_container_width=True)
+
+def show_basketball_loader(placeholder: st.delta_generator.DeltaGenerator, text: str) -> None:
+    placeholder.markdown(f"""
+<div class="loader-wrap">
+  <div class="loader-text">{text}</div>
+  <div class="court"><div class="ball"></div></div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -746,7 +851,7 @@ def pick_player_row(players: pd.DataFrame, selected_name: str) -> Optional[pd.Se
 
 def page_predict(players: pd.DataFrame):
     st.header("NBA Prop Predictor — Elite")
-    st.caption("Auto opponent • Defense + Pace • Copyable table • Share image")
+    st.caption("Auto opponent • Defense + Pace • Animated loaders • Team-colored cards • Share image")
 
     if players is None or players.empty:
         st.error("No active players available. Click **Refresh players** in the sidebar and try again.")
@@ -789,8 +894,11 @@ def page_predict(players: pd.DataFrame):
         st.error("No game logs found."); return
 
     next_game = auto_next_opponent(team_id, season) if team_id > 0 else None
-    with st.spinner("Building features…"):
-        features = build_all_features(logs, season)
+
+    load_ph = st.empty()
+    show_basketball_loader(load_ph, "Building features…")
+    features = build_all_features(logs, season)
+    load_ph.empty()
 
     upcoming_ctx = {}
     next_info = "Next: N/A"
@@ -814,21 +922,25 @@ def page_predict(players: pd.DataFrame):
         next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']} · Rest {rest_days}d"
     st.markdown(f'<span class="badge">{next_info}</span>', unsafe_allow_html=True)
 
-    with st.spinner("Training models & predicting…"):
-        futures, results = {}, []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            for stat in PROP_MAP.keys():
-                futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode, model_budget, upcoming_ctx)] = stat
-            for fut in as_completed(futures): results.append(fut.result())
+    load2 = st.empty()
+    show_basketball_loader(load2, "Training models & predicting…")
+    futures, results = {}, []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for stat in PROP_MAP.keys():
+            futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode, model_budget, upcoming_ctx)] = stat
+        for fut in as_completed(futures): results.append(fut.result())
+    load2.empty()
 
+    # --- Metric cards (replace table) ---
+    st.subheader("Predicted Props")
+    render_metric_cards(results, TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
+
+    # CSV + bar chart still available
     df_table = results_to_table(results)
-    st.subheader("Predicted Props — Table")
-    st.dataframe(df_table, use_container_width=True, hide_index=True)
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_predictions")
+    bar_chart_from_table(df_table, title="Predictions (bars)", color=TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
 
-    bar_chart_from_table(df_table, title="Predictions (bars)", color=team_color)
-
-    img_bytes = make_share_image(name, season, photo, df_table, next_info)
+    img_bytes = make_share_image(name, season, photo, df_table[["Stat","Pred","Model","MAE","MSE"]], next_info)
     st.download_button("📸 Share image (PNG)", data=img_bytes, file_name=f"{name.replace(' ','_')}_{season}_predictions.png", mime="image/png")
 
     st.divider()
@@ -959,7 +1071,7 @@ def page_favorites(players: pd.DataFrame):
         c = alt.Chart(df_table.rename(columns={"Pred":"Prediction"})).mark_bar(color=team_color).encode(
             x=alt.X("Stat:N", sort=df_table["Stat"].tolist()),
             y=alt.Y("Prediction:Q"),
-            tooltip=["Stat","Prediction","Model","MAE","MSE"],
+            tooltip=["Stat","Prediction","Model","MAE","MSE","Confidence"],
         ).properties(width="container", height=220, title=f"{pname} — Predictions")
         st.altair_chart(c, use_container_width=True)
 
@@ -999,7 +1111,7 @@ def main():
         if st.button("🔄 Refresh players"):
             load_player_list.clear()
             _rerun()
-        st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">CSV</span> <span class="tag">Share</span>', unsafe_allow_html=True)
+        st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">Cards</span> <span class="tag">Share</span>', unsafe_allow_html=True)
 
     players = load_player_list("2025-26")
 
@@ -1011,4 +1123,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
