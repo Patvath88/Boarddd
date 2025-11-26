@@ -1,11 +1,5 @@
 """
-NBA Prop Predictor — Pro Tier (Final Build)
-Predicts ALL NBA props for a selected player using:
-- Per-stat custom feature sets
-- Cached models for instant predictions
-- Multi-model ML ensemble (Linear, RF, XGB, etc.)
-- Automatic best-model selection per stat
-- Detailed MAE/MSE reporting
+NBA Prop Predictor — Pro Tier (Stability Patch + TARGET Fix + Metric Card UI)
 """
 
 from __future__ import annotations
@@ -41,14 +35,14 @@ STAT_COLUMNS = ["PTS","REB","AST","STL","BLK","TOV","FG3M","MIN"]
 
 
 # ======================================================================
-# FEATURE ENGINEERING UTILITIES
+# FEATURE ENGINEERING HELPERS
 # ======================================================================
 
 def compute_opponent_strength(df):
     opp = df.groupby("OPP_TEAM")[["PTS","REB","AST"]].mean().rename(columns={
-        "PTS":"OPP_ALLOW_PTS",
-        "REB":"OPP_ALLOW_REB",
-        "AST":"OPP_ALLOW_AST"
+        "PTS": "OPP_ALLOW_PTS",
+        "REB": "OPP_ALLOW_REB",
+        "AST": "OPP_ALLOW_AST",
     })
     return df.join(opp, on="OPP_TEAM")
 
@@ -68,8 +62,8 @@ def rolling_features(df, col):
 
 def trend_feature(df, col):
     df[f"{col}_TREND"] = df[col].rolling(5).apply(
-        lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x)==5 else np.nan,
-        raw=True
+        lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) == 5 else np.nan,
+        raw=True,
     )
     return df
 
@@ -83,32 +77,40 @@ def context_features(df):
 
 
 # ======================================================================
-# CUSTOM FEATURE SET PER PROP STAT
+# PER-PROP FEATURE BUILDER
 # ======================================================================
 
 def build_features_for_stat(df, stat):
     df = df.copy()
 
-    if isinstance(PROP_MAP[stat], list):
-        cols = PROP_MAP[stat]
-    else:
-        cols = [PROP_MAP[stat]]
+    cols = PROP_MAP[stat] if isinstance(PROP_MAP[stat], list) else [PROP_MAP[stat]]
 
     for col in cols:
         df = lag_features(df, col)
         df = rolling_features(df, col)
         df = trend_feature(df, col)
 
-    base_cols = ["IS_HOME","REST_DAYS","BACK_TO_BACK",
-                 "OPP_ALLOW_PTS","OPP_ALLOW_REB","OPP_ALLOW_AST"]
+    base_cols = [
+        "IS_HOME",
+        "REST_DAYS",
+        "BACK_TO_BACK",
+        "OPP_ALLOW_PTS",
+        "OPP_ALLOW_REB",
+        "OPP_ALLOW_AST",
+    ]
 
     ignore = [
-        "GAME_DATE","MATCHUP","SEASON_ID","TEAM_ABBREVIATION",
-        "WL","VIDEO_AVAILABLE","OPP_TEAM"
+        "GAME_DATE",
+        "MATCHUP",
+        "SEASON_ID",
+        "TEAM_ABBREVIATION",
+        "WL",
+        "VIDEO_AVAILABLE",
+        "OPP_TEAM",
     ]
 
     X = df.drop(columns=ignore, errors="ignore")
-    X = X.select_dtypes(include=["float","int"])
+    X = X.select_dtypes(include=["float", "int"])
 
     for bc in base_cols:
         if bc in df.columns:
@@ -119,7 +121,7 @@ def build_features_for_stat(df, stat):
 
 
 # ======================================================================
-# DATASET BUILDER
+# TRAINING DATA PREPARATION
 # ======================================================================
 
 def build_training_dataset(logs):
@@ -132,12 +134,12 @@ def build_training_dataset(logs):
     df = compute_opponent_strength(df)
     df = context_features(df)
 
-    df = df.dropna(subset=["PTS","REB","AST"])
+    df = df.dropna(subset=["PTS", "REB", "AST"])
     return df.reset_index(drop=True)
 
 
 # ======================================================================
-# MODEL CACHE — one model per stat per player
+# MODEL CACHE: One model per player, per stat
 # ======================================================================
 
 @st.cache_resource
@@ -148,7 +150,7 @@ def get_cached_model(player_id, stat, X, y):
 
 
 # ======================================================================
-# PLAYER LIST
+# PLAYER LIST CACHE
 # ======================================================================
 
 @st.cache_data(show_spinner=False)
@@ -156,21 +158,26 @@ def load_player_list():
     try:
         p = dfetch.get_active_players_balldontlie()
         p["full_name"] = p["first_name"] + " " + p["last_name"]
-        return p.sort_values("full_name")[["id","full_name","team_id"]]
+        return p.sort_values("full_name")[["id", "full_name", "team_id"]]
     except:
         fallback = dfetch.get_player_list_nba()
         fallback["full_name"] = fallback["full_name"]
         fallback["team_id"] = None
-        return fallback[["id","full_name","team_id"]]
+        return fallback[["id", "full_name", "team_id"]]
 
 
 # ======================================================================
-# MAIN APP
+# MAIN
 # ======================================================================
 
 def main():
-    st.set_page_config(page_title="NBA Prop Predictor Pro", page_icon="🏀", layout="wide")
-    st.title("NBA Prop Predictor — Full Auto-Prop Mode")
+    st.set_page_config(
+        page_title="NBA Prop Predictor Pro",
+        page_icon="🏀",
+        layout="wide",
+    )
+
+    st.title("NBA Prop Predictor — Full Auto Mode")
 
     players = load_player_list()
 
@@ -184,9 +191,12 @@ def main():
         st.info("Choose a player and click 'Get Predictions Now'")
         return
 
-    year = datetime.date.today().year
-    season_str = f"{year-1}-{str(year)[-2:]}"
-    logs = dfetch.get_player_game_logs_nba(player_id, season_str)
+    # Load season (preferring 2025-26)
+    logs = dfetch.get_player_game_logs_nba(player_id, "2025-26")
+    if logs.empty:
+        year = datetime.date.today().year
+        fallback = f"{year-1}-{str(year)[-2:]}"
+        logs = dfetch.get_player_game_logs_nba(player_id, fallback)
 
     if logs.empty:
         st.error("No game logs found.")
@@ -197,56 +207,89 @@ def main():
     results = []
 
     for stat in PROP_MAP.keys():
-
         df_local = df.copy()
 
+        # TARGET (always 1D)
         if isinstance(PROP_MAP[stat], list):
             df_local["TARGET"] = df_local[PROP_MAP[stat]].sum(axis=1)
         else:
             df_local["TARGET"] = df_local[PROP_MAP[stat]]
+
+        df_local["TARGET"] = pd.to_numeric(df_local["TARGET"], errors="coerce")
+        df_local["TARGET"] = df_local["TARGET"].astype(float)
+        df_local["TARGET"] = df_local["TARGET"].squeeze()
 
         y = df_local["TARGET"]
 
         X = build_features_for_stat(df_local, stat)
 
         df_final = pd.concat([y, X], axis=1).dropna()
-        y_final = df_final["TARGET"]
+
+        # REMOVE DUPLICATE COLUMNS
+        df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+
+        # ENSURE y_final IS 1D
+        y_final = df_final["TARGET"].astype(float).values.ravel()
+
         X_final = df_final.drop(columns=["TARGET"])
 
+        # Train or load cached model
         manager = get_cached_model(player_id, stat, X_final, y_final)
 
         X_next = X_final.tail(1)
         predictions = manager.predict(X_next)
+
         best = manager.best_model()
 
-        results.append({
-            "Stat": stat,
-            "Prediction": best.prediction,
-            "Best Model": best.name,
-            "MAE": best.mae,
-            "MSE": best.mse
-        })
+        results.append(
+            {
+                "Stat": stat,
+                "Prediction": best.prediction,
+                "Best Model": best.name,
+                "MAE": best.mae,
+                "MSE": best.mse,
+            }
+        )
 
-    # Show predictions in compact metric cards instead of a raw table
-    st.subheader("Predicted Props")
-    # Display each stat prediction as a separate card for improved mobile readability
-    for res in results:
-        # Use a container to group the metric and its details together
+    # ======================================================================
+    # Metric Card Display (Mobile Friendly)
+    # ======================================================================
+
+    st.subheader("Predicted Props (AI Model Ensemble)")
+
+    for r in results:
         with st.container():
-            # Primary metric shows the predicted value for the stat
-            st.metric(label=res["Stat"], value=f"{res['Prediction']:.2f}")
-            # Additional model details as a caption beneath the metric
-            st.caption(
-                f"Best Model: {res['Best Model']} | MAE: {res['MAE']:.2f} | MSE: {res['MSE']:.2f}"
+            st.metric(
+                label=f"{r['Stat']}",
+                value=round(r["Prediction"], 2),
+                delta=None,
             )
-            # Add a horizontal rule to separate cards visually
+            st.caption(
+                f"Model: {r['Best Model']} | MAE: {r['MAE']:.2f} | MSE: {r['MSE']:.2f}"
+            )
             st.markdown("---")
+
+    # ======================================================================
+    # Recent Games Table
+    # ======================================================================
 
     st.subheader("Recent Games")
     st.dataframe(
-        logs[["GAME_DATE","MATCHUP","PTS","REB","AST",
-              "FG3M","STL","BLK","TOV","MIN"]],
-        use_container_width=True
+        logs[
+            [
+                "GAME_DATE",
+                "MATCHUP",
+                "PTS",
+                "REB",
+                "AST",
+                "FG3M",
+                "STL",
+                "BLK",
+                "TOV",
+                "MIN",
+            ]
+        ],
+        use_container_width=True,
     )
 
 
