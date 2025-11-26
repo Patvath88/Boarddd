@@ -1,11 +1,10 @@
 # app.py
 """
-NBA Prop Predictor — Elite (Auto Next Opponent + Opponent Defense in Features)
-- Auto-detect next opponent from balldontlie (no manual selection)
-- League defensive strength features: OPP_DEF_PPG + OPP_DEF_Z
-- Inject upcoming opponent + home/away + rest days into X_next
-- Time-series CV modeling (linear + boosting) as before
-- Outlier-like dark UI, copyable/downloadable table, share images/zip, favorites, saved runs
+NBA Prop Predictor — Elite
+- Auto next opponent + Opponent Defense & Pace (DEF_Z, PACE_Z, DEFxPACE)
+- Outlier-style UI, photos, logos, glowing team cards
+- Copyable/downloadable tables, share images, favorites with 1-click remove
+- Bar charts on every page
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import requests
+import altair as alt
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
@@ -53,11 +53,12 @@ PROP_MAP = {
 }
 STAT_COLUMNS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "MIN"]
 
-# add defense metrics to base columns
 BASE_COLS = [
     "IS_HOME", "REST_DAYS", "BACK_TO_BACK",
     "OPP_ALLOW_PTS", "OPP_ALLOW_REB", "OPP_ALLOW_AST",
-    "OPP_DEF_PPG", "OPP_DEF_Z"
+    "OPP_DEF_PPG", "OPP_DEF_Z",
+    "OPP_PACE", "OPP_PACE_Z",
+    "OPP_DEF_X_PACE",
 ]
 
 N_TRAIN = 60
@@ -71,6 +72,44 @@ FAV_FILE = DATA_DIR / "favorites.json"
 
 
 # =============================================================================
+# TEAM META (colors + NBA logo ids)
+# =============================================================================
+
+TEAM_META: Dict[str, Dict[str, str | int]] = {
+    "ATL": {"color": "#E03A3E", "nba_id": 1610612737, "name": "Hawks"},
+    "BOS": {"color": "#007A33", "nba_id": 1610612738, "name": "Celtics"},
+    "BKN": {"color": "#000000", "nba_id": 1610612751, "name": "Nets"},
+    "CHA": {"color": "#1D1160", "nba_id": 1610612766, "name": "Hornets"},
+    "CHI": {"color": "#CE1141", "nba_id": 1610612741, "name": "Bulls"},
+    "CLE": {"color": "#860038", "nba_id": 1610612739, "name": "Cavaliers"},
+    "DAL": {"color": "#00538C", "nba_id": 1610612742, "name": "Mavericks"},
+    "DEN": {"color": "#0E2240", "nba_id": 1610612743, "name": "Nuggets"},
+    "DET": {"color": "#C8102E", "nba_id": 1610612765, "name": "Pistons"},
+    "GSW": {"color": "#1D428A", "nba_id": 1610612744, "name": "Warriors"},
+    "HOU": {"color": "#CE1141", "nba_id": 1610612745, "name": "Rockets"},
+    "IND": {"color": "#002D62", "nba_id": 1610612754, "name": "Pacers"},
+    "LAC": {"color": "#C8102E", "nba_id": 1610612746, "name": "Clippers"},
+    "LAL": {"color": "#552583", "nba_id": 1610612747, "name": "Lakers"},
+    "MEM": {"color": "#5D76A9", "nba_id": 1610612763, "name": "Grizzlies"},
+    "MIA": {"color": "#98002E", "nba_id": 1610612748, "name": "Heat"},
+    "MIL": {"color": "#00471B", "nba_id": 1610612749, "name": "Bucks"},
+    "MIN": {"color": "#0C2340", "nba_id": 1610612750, "name": "Timberwolves"},
+    "NOP": {"color": "#0C2340", "nba_id": 1610612740, "name": "Pelicans"},
+    "NYK": {"color": "#006BB6", "nba_id": 1610612752, "name": "Knicks"},
+    "OKC": {"color": "#007AC1", "nba_id": 1610612760, "name": "Thunder"},
+    "ORL": {"color": "#0077C0", "nba_id": 1610612753, "name": "Magic"},
+    "PHI": {"color": "#006BB6", "nba_id": 1610612755, "name": "76ers"},
+    "PHX": {"color": "#1D1160", "nba_id": 1610612756, "name": "Suns"},
+    "POR": {"color": "#E03A3E", "nba_id": 1610612757, "name": "Trail Blazers"},
+    "SAC": {"color": "#5A2D81", "nba_id": 1610612758, "name": "Kings"},
+    "SAS": {"color": "#C4CED4", "nba_id": 1610612759, "name": "Spurs"},
+    "TOR": {"color": "#CE1141", "nba_id": 1610612761, "name": "Raptors"},
+    "UTA": {"color": "#002B5C", "nba_id": 1610612762, "name": "Jazz"},
+    "WAS": {"color": "#002B5C", "nba_id": 1610612764, "name": "Wizards"},
+}
+
+
+# =============================================================================
 # STYLING (Outlier-like)
 # =============================================================================
 
@@ -79,7 +118,7 @@ def inject_css() -> None:
         """
 <style>
 html, body { font-family: Inter, ui-sans-serif, system-ui; }
-.block-container { padding-top: 1.2rem; max-width: 1200px; }
+.block-container { padding-top: 1.2rem; max-width: 1240px; }
 h1, h2, h3, h4 {
   background: linear-gradient(90deg,#e2e8f0 0%, #60a5fa 40%, #34d399 100%);
   -webkit-background-clip: text; -webkit-text-fill-color: transparent;
@@ -104,6 +143,13 @@ h1, h2, h3, h4 {
 .badge { display:inline-block; padding:.25rem .6rem; border-radius:10px; font-size:.8rem;
   background:rgba(34,197,94,.15); border:1px solid rgba(34,197,94,.4); color:#d1fae5; }
 [data-testid="stDataFrame"] { border-radius: 12px; border: 1px solid rgba(255,255,255,0.08); }
+
+/* favorite cards grid */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.team-card { position: relative; padding: 14px; border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: #0b1220; }
+.team-card .hdr { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.team-card .del { position:absolute; top:10px; right:12px; background:#ef4444; color:white; border:none; border-radius:10px; padding: 2px 8px; cursor:pointer; }
+.team-card .meta { font-size:.9rem; color:#cbd5e1; }
 </style>
         """,
         unsafe_allow_html=True,
@@ -140,13 +186,20 @@ def _hash_frame_small(X: pd.DataFrame, y: np.ndarray, player_id: int, season: st
 
 
 def season_start_year(season: str) -> int:
-    s = season.split("-")[0]
-    return int(s)
+    return int(season.split("-")[0])
 
 
 def prev_season(season: str) -> str:
     s0 = season_start_year(season)
     return f"{s0-1}-{str(s0)[-2:]}"
+
+
+def nba_logo_url(team_abbr: str) -> str | None:
+    meta = TEAM_META.get(team_abbr)
+    if not meta: return None
+    tid = meta["nba_id"]
+    # png fallback for Streamlit
+    return f"https://cdn.nba.com/logos/nba/{tid}/global/L/logo.png"
 
 
 # =============================================================================
@@ -219,8 +272,18 @@ def _safe_image_from_bytes(photo_bytes: Optional[bytes], size=(220, 220)) -> Ima
 # =============================================================================
 
 @st.cache_data(show_spinner=False)
+def load_teams_bdl() -> pd.DataFrame:
+    try:
+        r = requests.get("https://www.balldontlie.io/api/v1/teams", timeout=8)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        return pd.DataFrame(data)[["id","abbreviation","full_name"]]
+    except Exception:
+        return pd.DataFrame(columns=["id","abbreviation","full_name"])
+
+
+@st.cache_data(show_spinner=False)
 def load_player_list(season: str = "2025-26"):
-    # active-only dropdown; try balldontlie first
     try:
         p = dfetch.get_active_players_balldontlie()
         if "id" not in p.columns and "player_id" in p.columns:
@@ -232,9 +295,13 @@ def load_player_list(season: str = "2025-26"):
         if "team_id" not in p.columns:
             if "team" in p.columns and isinstance(p["team"].iloc[0], dict):
                 p["team_id"] = p["team"].apply(lambda t: t.get("id") if isinstance(t, dict) else None)
+                p["team_abbr"] = p["team"].apply(lambda t: t.get("abbreviation") if isinstance(t, dict) else None)
             else:
                 p["team_id"] = p.get("TEAM_ID", None)
-        cols = ["id", "full_name", "team_id"] + (["nba_person_id"] if "nba_person_id" in p.columns else [])
+        if "team_abbr" not in p.columns:
+            teams = load_teams_bdl()
+            p = p.merge(teams.rename(columns={"id":"team_id","abbreviation":"team_abbr"}), on="team_id", how="left")
+        cols = ["id", "full_name", "team_id", "team_abbr"] + (["nba_person_id"] if "nba_person_id" in p.columns else [])
         return p[cols].dropna(subset=["id"]).drop_duplicates(subset=["id"]).sort_values("full_name")
     except Exception:
         fb = dfetch.get_player_list_nba()
@@ -247,8 +314,9 @@ def load_player_list(season: str = "2025-26"):
                 if c in fb.columns: fb = fb.rename(columns={c:"team_id"}); break
         if "PERSON_ID" in fb.columns and "nba_person_id" not in fb.columns:
             fb = fb.rename(columns={"PERSON_ID": "nba_person_id"})
-        fb["team_id"] = fb.get("team_id", None)
-        cols = ["id","full_name","team_id"] + (["nba_person_id"] if "nba_person_id" in fb.columns else [])
+        teams = load_teams_bdl()
+        fb = fb.merge(teams.rename(columns={"id":"team_id","abbreviation":"team_abbr"}), on="team_id", how="left")
+        cols = ["id","full_name","team_id","team_abbr"] + (["nba_person_id"] if "nba_person_id" in fb.columns else [])
         return fb[cols].dropna(subset=["id"]).drop_duplicates(subset=["id"]).sort_values("full_name")
 
 
@@ -287,11 +355,10 @@ def load_logs(player_id: int, season: str) -> pd.DataFrame:
 
 
 # =============================================================================
-# AUTO NEXT OPPONENT + LEAGUE DEFENSE
+# AUTO NEXT OPPONENT + LEAGUE DEFENSE & PACE
 # =============================================================================
 
 def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
-    """Paginate balldontlie responses (why: games ~1.2k per season)."""
     out: List[Dict] = []
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
@@ -312,40 +379,32 @@ def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
 
 
 @st.cache_data(show_spinner=False)
-def load_team_defense_metrics(season: str) -> pd.DataFrame:
-    """
-    League defense proxy from balldontlie games:
-    DEF_PPG = average points allowed per game (lower => stronger defense).
-    Also compute league-relative z-score.
-    """
+def load_team_defense_pace(season: str) -> pd.DataFrame:
+    """Defense (allowed PPG) + Pace proxy (total points per game) per team + z-scores."""
     year = season_start_year(season)
     games = _bdl_paginate("https://www.balldontlie.io/api/v1/games", {"seasons[]": year})
     if not games:
-        # empty fallback (neutral)
-        return pd.DataFrame(columns=["team_id","abbreviation","OPP_DEF_PPG","OPP_DEF_Z"])
+        return pd.DataFrame(columns=["team_id","abbreviation","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z"])
 
     rows = []
     for g in games:
         h = g.get("home_team", {}); v = g.get("visitor_team", {})
         hs = g.get("home_team_score", 0); vs = g.get("visitor_team_score", 0)
-        # each row is team perspective: allowed points = opponent score
-        rows.append({"team_id": h.get("id"), "abbreviation": h.get("abbreviation"), "allowed": vs})
-        rows.append({"team_id": v.get("id"), "abbreviation": v.get("abbreviation"), "allowed": hs})
+        total = (hs + vs)  # pace proxy
+        rows.append({"team_id": h.get("id"), "abbreviation": h.get("abbreviation"), "allowed": vs, "total": total})
+        rows.append({"team_id": v.get("id"), "abbreviation": v.get("abbreviation"), "allowed": hs, "total": total})
 
     df = pd.DataFrame(rows).dropna(subset=["team_id"])
-    agg = df.groupby(["team_id","abbreviation"], as_index=False)["allowed"].mean()
-    agg = agg.rename(columns={"allowed": "OPP_DEF_PPG"})  # lower is better
-    mu, sigma = agg["OPP_DEF_PPG"].mean(), agg["OPP_DEF_PPG"].std(ddof=0) or 1.0
-    agg["OPP_DEF_Z"] = (agg["OPP_DEF_PPG"] - mu) / sigma
+    agg = df.groupby(["team_id","abbreviation"], as_index=False).agg(OPP_DEF_PPG=("allowed","mean"), PACE=("total","mean"))
+    mu_d, sd_d = agg["OPP_DEF_PPG"].mean(), agg["OPP_DEF_PPG"].std(ddof=0) or 1.0
+    mu_p, sd_p = agg["PACE"].mean(), agg["PACE"].std(ddof=0) or 1.0
+    agg["OPP_DEF_Z"] = (agg["OPP_DEF_PPG"] - mu_d) / sd_d
+    agg["PACE_Z"] = (agg["PACE"] - mu_p) / sd_p
     return agg
 
 
 @st.cache_data(show_spinner=False)
 def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
-    """
-    Find next scheduled game for the team in the given season using balldontlie.
-    Returns: {opp_id, opp_abbr, date (UTC date), is_home}
-    """
     year = season_start_year(season)
     today = dt.date.today().isoformat()
     s = requests.Session(); s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
@@ -356,9 +415,7 @@ def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
             timeout=8,
         )
         j = r.json(); data = j.get("data", [])
-        if not data:
-            return None
-        # pick earliest future game by date
+        if not data: return None
         def _d(x): return dt.datetime.fromisoformat(x["date"].replace("Z","+00:00"))
         nxt = sorted(data, key=_d)[0]
         h, v = nxt["home_team"], nxt["visitor_team"]
@@ -393,12 +450,16 @@ def add_context_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def attach_team_defense(df: pd.DataFrame, defense: pd.DataFrame) -> pd.DataFrame:
-    if defense is None or defense.empty:
-        df["OPP_DEF_PPG"] = df["OPP_DEF_Z"] = np.nan
+def attach_defense_pace(df: pd.DataFrame, defense_pace: pd.DataFrame) -> pd.DataFrame:
+    if defense_pace is None or defense_pace.empty:
+        for c in ["OPP_DEF_PPG","OPP_DEF_Z","OPP_PACE","OPP_PACE_Z","OPP_DEF_X_PACE"]:
+            df[c] = np.nan
         return df
-    m = defense.rename(columns={"abbreviation": "OPP_TEAM"})
-    return df.merge(m[["OPP_TEAM", "OPP_DEF_PPG", "OPP_DEF_Z"]], on="OPP_TEAM", how="left")
+    m = defense_pace.rename(columns={"abbreviation": "OPP_TEAM"})
+    df = df.merge(m[["OPP_TEAM", "OPP_DEF_PPG", "OPP_DEF_Z", "PACE", "PACE_Z"]], on="OPP_TEAM", how="left")
+    df = df.rename(columns={"PACE": "OPP_PACE", "PACE_Z": "OPP_PACE_Z"})
+    df["OPP_DEF_X_PACE"] = df["OPP_DEF_Z"] * df["OPP_PACE_Z"]
+    return df
 
 
 def _ensure_training_base(df: pd.DataFrame, season: str) -> pd.DataFrame:
@@ -407,9 +468,8 @@ def _ensure_training_base(df: pd.DataFrame, season: str) -> pd.DataFrame:
     df = compute_opponent_strength(df)
     df = add_context_features(df)
     df = df.dropna(subset=["PTS","REB","AST"])
-    # attach league defense proxy
-    defense = load_team_defense_metrics(season)
-    df = attach_team_defense(df, defense)
+    dp = load_team_defense_pace(season)
+    df = attach_defense_pace(df, dp)
     return df.reset_index(drop=True)
 
 
@@ -492,14 +552,12 @@ def train_predict_for_stat(
         X_final = X_final.iloc[-N_TRAIN:].copy()
         y_final = y_final[-N_TRAIN:].copy()
 
-    # features for next game
     X_next = X_final.tail(1).copy()
     if upcoming_ctx:
         for k, v in upcoming_ctx.items():
             if k in X_next.columns:
                 X_next.loc[:, k] = v
 
-    # fast path or tiny sample
     if fast_mode or len(X_final) < MIN_ROWS_FOR_MODEL:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
         return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(10G Mean)" if fast_mode else "Baseline(SmallSample)", "MAE": float("nan"), "MSE": float("nan")}
@@ -515,7 +573,7 @@ def train_predict_for_stat(
 
 
 # =============================================================================
-# SHARE/TABLE HELPERS
+# TABLE + CHARTS + SHARE
 # =============================================================================
 
 def results_to_table(results: List[Dict]) -> pd.DataFrame:
@@ -563,21 +621,31 @@ def make_share_image(player_name: str, season: str, photo_bytes: Optional[bytes]
     buf = io.BytesIO(); bg.save(buf, format="PNG", optimize=True); return buf.getvalue()
 
 
+def bar_chart_from_table(df: pd.DataFrame, title: str, color: str | None = None):
+    c = alt.Chart(df).mark_bar(color=color).encode(
+        x=alt.X("Stat:N", sort=df["Stat"].tolist()),
+        y=alt.Y("Pred:Q"),
+        tooltip=["Stat","Pred","Model","MAE","MSE"],
+    ).properties(height=280, title=title)
+    st.altair_chart(c, use_container_width=True)
+
+
 # =============================================================================
 # PAGES
 # =============================================================================
 
 def page_predict(players: pd.DataFrame):
     st.header("NBA Prop Predictor — Elite")
-    st.caption("Auto opponent • Opponent defense • Copyable table • Share image")
+    st.caption("Auto opponent • Defense + Pace • Copyable table • Share image")
 
-    # Select player
     col_left, col_right = st.columns([1, 3])
     with col_left:
         name = st.selectbox("Select Player", players["full_name"], key="predict_player")
         row = players[players["full_name"] == name].iloc[0]
         player_id = int(row["id"])
         team_id = int(row.get("team_id", 0) or 0)
+        team_abbr = str(row.get("team_abbr") or "")
+        team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
         nba_pid = int(row["nba_person_id"]) if "nba_person_id" in row and not pd.isna(row["nba_person_id"]) else None
         fast_mode = st.toggle("Fast mode (no training)", value=False, key="fast_toggle")
         run = st.button("Get Predictions Now")
@@ -599,31 +667,29 @@ def page_predict(players: pd.DataFrame):
     if logs.empty:
         st.error("No game logs found."); return
 
-    # Auto-detect next opponent + build features
     next_game = auto_next_opponent(team_id, season)
     with st.spinner("Building features…"):
         features = build_all_features(logs, season)
 
-    # Upcoming context for X_next (defense + home/away + rest)
     upcoming_ctx = {}
-    next_info = "Next game: N/A"
+    next_info = "Next: N/A"
     if next_game:
-        defense = load_team_defense_metrics(season)
-        opp_row = defense[defense["abbreviation"] == next_game["opp_abbr"]]
+        dp = load_team_defense_pace(season)
+        opp_row = dp[dp["abbreviation"] == next_game["opp_abbr"]]
         if not opp_row.empty:
             upcoming_ctx["OPP_DEF_PPG"] = float(opp_row["OPP_DEF_PPG"].iloc[0])
             upcoming_ctx["OPP_DEF_Z"]   = float(opp_row["OPP_DEF_Z"].iloc[0])
-        # IS_HOME, REST_DAYS, B2B
+            upcoming_ctx["OPP_PACE"]    = float(opp_row["PACE"].iloc[0])
+            upcoming_ctx["OPP_PACE_Z"]  = float(opp_row["PACE_Z"].iloc[0])
+            upcoming_ctx["OPP_DEF_X_PACE"] = upcoming_ctx["OPP_DEF_Z"] * upcoming_ctx["OPP_PACE_Z"]
         last_date = pd.to_datetime(features["GAME_DATE"]).max().date()
         rest_days = max(0, (next_game["date"] - last_date).days)
         upcoming_ctx["IS_HOME"] = 1 if next_game["is_home"] else 0
         upcoming_ctx["REST_DAYS"] = rest_days
         upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
-        next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']}  ·  Rest {rest_days}d"
-
+        next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']} · Rest {rest_days}d"
     st.markdown(f'<span class="badge">{next_info}</span>', unsafe_allow_html=True)
 
-    # Predict (parallel)
     with st.spinner("Training models & predicting…"):
         futures, results = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -636,7 +702,8 @@ def page_predict(players: pd.DataFrame):
     st.dataframe(df_table, use_container_width=True, hide_index=True)
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_predictions")
 
-    # Share image
+    bar_chart_from_table(df_table, title="Predictions (bars)", color=team_color)
+
     img_bytes = make_share_image(name, season, photo, df_table, next_info)
     st.download_button("📸 Share image (PNG)", data=img_bytes, file_name=f"{name.replace(' ','_')}_{season}_predictions.png", mime="image/png")
 
@@ -666,15 +733,20 @@ def page_predict(players: pd.DataFrame):
 def page_backtest(players: pd.DataFrame):
     st.header("Backtesting")
     name = st.selectbox("Player", players["full_name"], key="bt_player")
-    player_id = int(players[players["full_name"] == name].iloc[0]["id"])
+    prow = players[players["full_name"] == name].iloc[0]
+    player_id = int(prow["id"])
+    team_abbr = str(prow.get("team_abbr") or "")
+    team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
+
     season = "2025-26"
     do_this = st.checkbox("This season", value=True)
     do_last = st.checkbox("Last season", value=True)
     run = st.button("Run Backtests")
     if not run: return
 
-    seasons = ([] if not do_this and not do_last else [s for s in [season, prev_season(season)] if (s==season and do_this) or (s!=season and do_last)])
-    if not seasons: st.info("Pick at least one season."); return
+    seasons = []
+    if do_this: seasons.append(season)
+    if do_last: seasons.append(prev_season(season))
 
     for s in seasons:
         logs = load_logs(player_id, s)
@@ -684,13 +756,14 @@ def page_backtest(players: pd.DataFrame):
         st.subheader(f"{name} — {s}")
         s_rows = []
         for stat in PROP_MAP.keys():
-            # walk-forward with expanding window; reuse ModelManager internally
             df_bt, summary = _walk_forward_backtest_internal(player_id, s, stat, features)
             st.markdown(f"**{stat}** — MAE: `{summary['MAE']:.2f}` · RMSE: `{summary['RMSE']:.2f}` · N: `{summary['N']}`")
-            with st.expander(f"Details — {stat}"):
-                st.dataframe(df_bt, use_container_width=True)
             s_rows.append({"Stat": stat, **summary})
-        st.dataframe(pd.DataFrame(s_rows).set_index("Stat"), use_container_width=True)
+        df_sum = pd.DataFrame(s_rows).set_index("Stat")
+        st.dataframe(df_sum, use_container_width=True)
+        chart_df = df_sum.reset_index()[["Stat","MAE"]]
+        c = alt.Chart(chart_df).mark_bar(color=team_color).encode(x=alt.X("Stat:N", sort=chart_df["Stat"].tolist()), y="MAE:Q").properties(height=280, title="Backtest MAE by Stat")
+        st.altair_chart(c, use_container_width=True)
 
 
 def _walk_forward_backtest_internal(player_id: int, season: str, stat: str, features: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
@@ -717,9 +790,7 @@ def _walk_forward_backtest_internal(player_id: int, season: str, stat: str, feat
                 yhat = float(manager.predict(X_te))
             except Exception:
                 yhat = float(np.nanmean(y_tr[-10:])) if np.isfinite(y_tr[-10:]).any() else float("nan")
-        preds.append(yhat)
-        truth.append(float(test["TARGET"].iloc[0]))
-        dates.append(pd.to_datetime(test["GAME_DATE"].iloc[0]))
+        preds.append(yhat); truth.append(float(test["TARGET"].iloc[0])); dates.append(pd.to_datetime(test["GAME_DATE"].iloc[0]))
 
     out = pd.DataFrame({"GAME_DATE": dates, "y_true": truth, "y_pred": preds})
     out["abs_err"] = (out["y_true"] - out["y_pred"]).abs()
@@ -730,7 +801,7 @@ def _walk_forward_backtest_internal(player_id: int, season: str, stat: str, feat
 
 
 def page_favorites(players: pd.DataFrame):
-    st.header("Favorites (Auto Opponent • Defense • Share)")
+    st.header("Favorites (Auto Opponent • Defense & Pace • Glow Cards)")
     favs = _load_favorites()
 
     col1, col2 = st.columns([3,1])
@@ -741,25 +812,45 @@ def page_favorites(players: pd.DataFrame):
             row = players[players["full_name"] == name].iloc[0]
             pid = int(row["id"])
             nba_pid = int(row["nba_person_id"]) if "nba_person_id" in row and not pd.isna(row["nba_person_id"]) else None
+            team_id = int(row.get("team_id", 0) or 0)
+            team_abbr = str(row.get("team_abbr") or "")
             if not any(f["id"] == pid for f in favs):
-                favs.append({"id": pid, "full_name": name, "team_id": int(row.get("team_id", 0) or 0), "nba_person_id": nba_pid})
+                favs.append({
+                    "id": pid, "full_name": name,
+                    "team_id": team_id, "team_abbr": team_abbr,
+                    "nba_person_id": nba_pid
+                })
                 _save_favorites(favs); st.success("Added to favorites.")
             else:
                 st.info("Already in favorites.")
 
     if favs:
         st.subheader("Saved favorites")
-        df_f = pd.DataFrame(favs)
-        show_cols = [c for c in ["id","full_name","team_id","nba_person_id"] if c in df_f.columns]
-        st.dataframe(df_f[show_cols], use_container_width=True, hide_index=True)
-        remove_id = st.text_input("Remove by player id", value="")
-        if st.button("🗑️ Remove"):
-            try:
-                rid = int(remove_id)
-                favs = [f for f in favs if f["id"] != rid]
-                _save_favorites(favs); st.success("Removed.")
-            except Exception:
-                st.error("Enter a valid numeric player id.")
+        st.markdown('<div class="grid">', unsafe_allow_html=True)
+        for f in list(favs):
+            abbr = f.get("team_abbr") or ""
+            color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
+            logo = nba_logo_url(abbr)
+            # header row
+            col_html = f"""
+<div class="team-card" style="box-shadow: 0 0 24px {color}55;">
+  <button class="del" onclick="document.getElementById('del_{f['id']}').click()">❌</button>
+  <div class="hdr">
+    <img src="{logo or ''}" style="width:42px;height:42px;border-radius:8px;border:1px solid #222;background:#111" />
+    <div>
+      <div style="font-weight:700;color:#e5e7eb">{f['full_name']}</div>
+      <div class="meta">{abbr} · <span style="color:{color}">Glow</span></div>
+    </div>
+  </div>
+</div>
+"""
+            st.markdown(col_html, unsafe_allow_html=True)
+            # hidden real Streamlit button to remove
+            if st.button("", key=f"del_{f['id']}"):
+                favs = [x for x in favs if x["id"] != f["id"]]
+                _save_favorites(favs)
+                st.experimental_rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.info("No favorites yet.")
 
@@ -773,12 +864,15 @@ def page_favorites(players: pd.DataFrame):
     season = "2025-26"
     all_rows: List[pd.DataFrame] = []
     share_images: List[Tuple[str, bytes]] = []
-    defense = load_team_defense_metrics(season)
+    dp = load_team_defense_pace(season)
     progress = st.progress(0, text="Predicting for favorites…")
 
     for i, fav in enumerate(favs):
-        pid, pname, team_id = fav["id"], fav["full_name"], int(fav.get("team_id", 0) or 0)
+        pid, pname = fav["id"], fav["full_name"]
+        team_id = int(fav.get("team_id", 0) or 0)
+        abbr = fav.get("team_abbr") or ""
         nba_pid = fav.get("nba_person_id")
+
         logs = load_logs(pid, season)
         if logs.empty:
             year = dt.date.today().year
@@ -790,19 +884,23 @@ def page_favorites(players: pd.DataFrame):
 
         feats = build_all_features(logs, season)
         next_game = auto_next_opponent(team_id, season)
+
         upcoming_ctx = {}
         next_info = "Next: N/A"
         if next_game:
-            opp_row = defense[defense["abbreviation"] == next_game["opp_abbr"]]
+            opp_row = dp[dp["abbreviation"] == next_game["opp_abbr"]]
             if not opp_row.empty:
                 upcoming_ctx["OPP_DEF_PPG"] = float(opp_row["OPP_DEF_PPG"].iloc[0])
                 upcoming_ctx["OPP_DEF_Z"]   = float(opp_row["OPP_DEF_Z"].iloc[0])
+                upcoming_ctx["OPP_PACE"]    = float(opp_row["PACE"].iloc[0])
+                upcoming_ctx["OPP_PACE_Z"]  = float(opp_row["PACE_Z"].iloc[0])
+                upcoming_ctx["OPP_DEF_X_PACE"] = upcoming_ctx["OPP_DEF_Z"] * upcoming_ctx["OPP_PACE_Z"]
             last_date = pd.to_datetime(feats["GAME_DATE"]).max().date()
             rest_days = max(0, (next_game["date"] - last_date).days)
             upcoming_ctx["IS_HOME"] = 1 if next_game["is_home"] else 0
             upcoming_ctx["REST_DAYS"] = rest_days
             upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
-            next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']}  ·  Rest {rest_days}d"
+            next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']} · Rest {rest_days}d"
 
         futures, res = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -813,9 +911,20 @@ def page_favorites(players: pd.DataFrame):
         df_table.insert(0, "Player", pname); df_table.insert(1, "Season", season)
         all_rows.append(df_table)
 
+        # mini card with bar chart per player
+        team_color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
+        c = alt.Chart(df_table.rename(columns={"Pred":"Prediction"})).mark_bar(color=team_color).encode(
+            x=alt.X("Stat:N", sort=df_table["Stat"].tolist()),
+            y=alt.Y("Prediction:Q"),
+            tooltip=["Stat","Prediction","Model","MAE","MSE"],
+        ).properties(width="container", height=220, title=f"{pname} — Predictions")
+        st.altair_chart(c, use_container_width=True)
+
+        # share-card per player
         photo = get_player_photo_bytes(pid, nba_pid)
         img_bytes = make_share_image(pname, season, photo, df_table[["Stat","Pred","Model","MAE","MSE"]], next_info)
         share_images.append((f"{pname.replace(' ','_')}_{season}.png", img_bytes))
+
         progress.progress((i+1)/len(favs))
 
     progress.empty()
@@ -824,6 +933,7 @@ def page_favorites(players: pd.DataFrame):
         st.subheader("Bulk predictions — Table")
         st.dataframe(df_all, use_container_width=True, hide_index=True)
         table_downloaders(df_all, filename_prefix=f"favorites_{season}_predictions")
+
     if share_images:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -858,7 +968,7 @@ def main():
         st.markdown("## Navigation")
         page = st.radio("Go to", ["Predict", "Backtest", "Favorites", "Saved"], label_visibility="collapsed")
         st.markdown("---")
-        st.markdown('<span class="tag">Auto Opponent</span> <span class="tag">Defense</span> <span class="tag">CSV</span> <span class="tag">Share</span>', unsafe_allow_html=True)
+        st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">CSV</span> <span class="tag">Share</span>', unsafe_allow_html=True)
 
     if page == "Predict":
         page_predict(players)
@@ -872,4 +982,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
