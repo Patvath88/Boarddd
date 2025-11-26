@@ -1,12 +1,13 @@
-# app.py  (robust build)
+# app.py  (robust players loader + full app)
 """
-NBA Prop Predictor — Elite (Robust)
+NBA Prop Predictor — Elite (Robust Player Loader)
 - Predict • Favorites • Research • Slate
-- Opponent-aware projections (Def + Pace + position)
+- Opponent-aware projections (Defense + Pace + position)
 - Team-colored metric cards with Model + Confidence
 - Trading-card share image (mobile)
 - Analyst write-up
 - Safe timezone + optional Altair + global guard to avoid blank screen
+- NEW: Bulletproof player search (multi-source, paginated, cached)
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ except Exception:
     ZoneInfo = None  # type: ignore
 
 def get_est_tz():
-    """Robust EST timezone: ZoneInfo if available, else fixed UTC-5."""
     if ZoneInfo is not None:
         try:
             return ZoneInfo("America/New_York")
@@ -340,78 +340,132 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id","position"])
     p = df.copy()
+
+    # id
     for c in ["id","player_id","PLAYER_ID","PersonId","PERSON_ID"]:
         if c in p.columns:
             if c!="id": p = p.rename(columns={c:"id"}); break
+
+    # name
     if "full_name" not in p.columns:
         if {"first_name","last_name"}.issubset(p.columns):
             p["full_name"] = (p["first_name"].astype(str).str.strip()+" "+p["last_name"].astype(str).str.strip()).str.strip()
         elif "PLAYER" in p.columns: p["full_name"] = p["PLAYER"].astype(str)
         elif "DISPLAY_FIRST_LAST" in p.columns: p["full_name"] = p["DISPLAY_FIRST_LAST"].astype(str)
         else: p["full_name"] = p.get("full_name","Unknown")
+
+    # team columns
     p = _safe_get_team_cols(p)
     if "team_abbr" not in p.columns or p["team_abbr"].isna().all():
         teams = load_teams_bdl()
         if "team_id" in p.columns and not p["team_id"].isna().all() and not teams.empty:
             p = p.merge(teams.rename(columns={"id":"team_id","abbreviation":"team_abbr"}), on="team_id", how="left")
+
+    # nba_person_id
     for c in ["nba_person_id","PERSON_ID","personId","nba_id"]:
         if c in p.columns:
             if c!="nba_person_id": p = p.rename(columns={c:"nba_person_id"}); break
     if "nba_person_id" not in p.columns: p["nba_person_id"] = pd.NA
+
+    # position
     if "position" not in p.columns:
         for c in ["POSITION","pos","Pos","Position"]:
             if c in p.columns: p = p.rename(columns={c:"position"}); break
     if "position" not in p.columns: p["position"] = pd.NA
+
     cols = ["id","full_name","team_id","team_abbr","nba_person_id","position"]
     out = p[cols].dropna(subset=["id"]).drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
     out = out[out["full_name"].astype(str).str.strip().ne("")]
     return out
 
-@st.cache_data(show_spinner=False)
-def bdl_fetch_active_players_direct() -> pd.DataFrame:
+def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
     out=[]; s=requests.Session(); s.headers.update({"User-Agent":"Mozilla/5.0 (PropPredictor)"})
-    url="https://www.balldontlie.io/api/v1/players"; page=1
+    page=1
     while True:
+        q=params.copy(); q["page"]=page; q.setdefault("per_page",100)
         try:
-            r=s.get(url, params={"active":"true","per_page":100,"page":page}, timeout=8); r.raise_for_status()
-            j=r.json(); data=j.get("data",[]); 
-            if not data: break
-            out.extend(data); page=j.get("meta",{}).get("next_page") or None
-            if not page: break
+            r=s.get(url, params=q, timeout=10); r.raise_for_status()
+            j=r.json(); out.extend(j.get("data",[]))
+            nxt=j.get("meta",{}).get("next_page"); 
+            if not nxt: break
+            page=nxt
         except Exception: break
-    return pd.DataFrame(out)
+    return out
 
-@st.cache_data(show_spinner=False)
+def _likely_active_filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    # Heuristic: must have team info and non-empty full_name
+    m = df.copy()
+    m = m[m["full_name"].astype(str).str.len() > 0]
+    if "team_abbr" in m.columns:
+        m = m[~m["team_abbr"].isna()]
+    return m
+
+def bdl_fetch_players_robust() -> pd.DataFrame:
+    """Always try to return a large, deduped players table."""
+    # 1) active=true (preferred)
+    try:
+        active = _bdl_paginate("https://www.balldontlie.io/api/v1/players", {"active":"true"})
+        df_active = normalize_players_df(pd.DataFrame(active))
+    except Exception:
+        df_active = pd.DataFrame()
+    # 2) all players, then filter
+    df_all = pd.DataFrame()
+    if df_active.empty or len(df_active) < 250:
+        try:
+            allp = _bdl_paginate("https://www.balldontlie.io/api/v1/players", {})
+            df_all_raw = pd.DataFrame(allp)
+            df_all = normalize_players_df(df_all_raw)
+            df_all = _likely_active_filter(df_all)
+        except Exception:
+            df_all = pd.DataFrame()
+
+    # Merge best we have
+    merged = pd.concat([df_active, df_all], ignore_index=True) if not df_all.empty else df_active
+    merged = merged.drop_duplicates("id")
+
+    # 3) dfetch fallbacks
+    try:
+        raw = dfetch.get_active_players_balldontlie()
+        df_1 = normalize_players_df(raw)
+        merged = pd.concat([merged, df_1], ignore_index=True).drop_duplicates("id")
+    except Exception:
+        pass
+    try:
+        raw2 = dfetch.get_player_list_nba()
+        df_2 = normalize_players_df(raw2)
+        merged = pd.concat([merged, df_2], ignore_index=True).drop_duplicates("id")
+    except Exception:
+        pass
+
+    return merged.reset_index(drop=True)
+
+@st.cache_data(show_spinner=False, ttl=60*60*6)  # 6 hours
 def load_player_list(season: str="2025-26") -> pd.DataFrame:
-    try:
-        raw = dfetch.get_active_players_balldontlie(); p = normalize_players_df(raw)
-        if not p.empty: return p[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
-    except Exception: pass
-    try:
-        raw2 = bdl_fetch_active_players_direct(); p2 = normalize_players_df(raw2)
-        if not p2.empty: return p2[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
-    except Exception: pass
-    favs = _load_favorites()
-    if favs:
-        p3 = pd.DataFrame(favs)
-        for col in ["team_id","team_abbr","nba_person_id","position"]:
-            if col not in p3.columns: p3[col]=None
-        p3["team_id"]=p3["team_id"].apply(lambda x:safe_int(x,0))
-        p3["team_abbr"]=p3["team_abbr"].apply(lambda x:safe_str(x,""))
-        p3["nba_person_id"]=p3["nba_person_id"].apply(lambda x: None if x in (None,"",0) else int(x))
-        return p3[["id","full_name","team_id","team_abbr","nba_person_id","position"]].drop_duplicates("id").sort_values("full_name").reset_index(drop=True)
-    return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id","position"])
+    # Try robust builder
+    p = bdl_fetch_players_robust()
+    # Ensure we have a decent list size
+    if p is None or p.empty or len(p) < 200:
+        favs = _load_favorites()
+        if favs:
+            pf = pd.DataFrame(favs)
+            for col in ["team_id","team_abbr","nba_person_id","position"]:
+                if col not in pf.columns: pf[col]=None
+            pf["team_id"]=pf["team_id"].apply(lambda x:safe_int(x,0))
+            pf["team_abbr"]=pf["team_abbr"].apply(lambda x:safe_str(x,""))
+            pf["nba_person_id"]=pf["nba_person_id"].apply(lambda x: None if x in (None,"",0) else int(x))
+            p = normalize_players_df(pf)
+    # Final shape
+    if p is None or p.empty:
+        return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id","position"])
+    needed = ["id","full_name","team_id","team_abbr","nba_person_id","position"]
+    for c in needed:
+        if c not in p.columns: p[c]=pd.NA
+    return p[needed].dropna(subset=["id"]).drop_duplicates("id").sort_values("full_name").reset_index(drop=True)
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60*60*6)
 def load_player_list_all() -> pd.DataFrame:
-    try:
-        fb = dfetch.get_player_list_nba(); p = normalize_players_df(fb)
-        if not p.empty: return p[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
-    except Exception: pass
-    try:
-        raw2 = bdl_fetch_active_players_direct(); p2 = normalize_players_df(raw2)
-        if not p2.empty: return p2[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
-    except Exception: pass
+    # same as active but keep wider set
     return load_player_list("2025-26")
 
 @st.cache_data(show_spinner=False)
@@ -422,20 +476,6 @@ def load_logs(player_id: int, season: str) -> pd.DataFrame:
 # =============================================================================
 # DEFENSE & PACE
 # =============================================================================
-
-def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
-    out=[]; s=requests.Session(); s.headers.update({"User-Agent":"Mozilla/5.0 (PropPredictor)"})
-    page=1
-    while True:
-        q=params.copy(); q["page"]=page; q.setdefault("per_page",100)
-        try:
-            r=s.get(url, params=q, timeout=8); r.raise_for_status()
-            j=r.json(); out.extend(j.get("data",[]))
-            nxt=j.get("meta",{}).get("next_page"); 
-            if not nxt: break
-            page=nxt
-        except Exception: break
-    return out
 
 @st.cache_data(show_spinner=False)
 def load_team_defense_pace(season: str) -> pd.DataFrame:
@@ -765,8 +805,6 @@ def line_chart_from_long(long_df: pd.DataFrame, title: str):
         wide = long_df.pivot(index="GAME_DATE", columns="Stat", values="Val").sort_index()
         st.line_chart(wide, height=220)
 
-def get_font_png_title(size:int)->ImageFont.ImageFont: return get_font(size)
-
 def make_share_image_trading_card(
     player_name: str, team_abbr: str, team_name: str, team_color: str,
     season: str, next_info: str, photo_bytes: Optional[bytes], logo_bytes: Optional[bytes],
@@ -792,7 +830,7 @@ def make_share_image_trading_card(
     mask=Image.new("L",(540,540),0); ImageDraw.Draw(mask).ellipse((0,0,540,540), fill=255)
     head.putalpha(mask); bg.paste(head,(270,160),head)
 
-    f_title=get_font_png_title(72); f_sub=get_font(42); f_small=get_font(36)
+    f_title=get_font(72); f_sub=get_font(42); f_small=get_font(36)
     f_metric=get_font(84); f_metric_title=get_font(40)
 
     card=Image.new("RGBA",(980,1080),(16,22,36,245))
@@ -874,7 +912,7 @@ def page_predict(players: pd.DataFrame):
     st.header("NBA Prop Predictor — Elite")
 
     if players is None or players.empty:
-        st.error("No active players available. Use **Refresh players** in the sidebar and try again."); return
+        st.error("No active players available. Click **Refresh players** in the sidebar and check your network."); return
 
     names = ["— Select Player —"] + players["full_name"].astype(str).tolist()
     colL,colR = st.columns([1,3])
@@ -1292,6 +1330,7 @@ def main():
         page = st.radio("Go to", pages, index=pages.index(default) if default in pages else 0, key="sidebar_page")
         st.markdown("---")
         if st.button("🔄 Refresh players"):
+            # clear caches & reload
             load_player_list.clear(); load_player_list_all.clear()
             st.session_state["sidebar_page"] = page
             _rerun()
