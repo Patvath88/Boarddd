@@ -1,11 +1,12 @@
-# app.py
+# app.py  (robust build)
 """
-NBA Prop Predictor — Elite
+NBA Prop Predictor — Elite (Robust)
 - Predict • Favorites • Research • Slate
-- Opponent-aware (Defense + Pace + positional) projections
-- Team-colored metric cards with model & confidence
-- Trading-card share image (mobile 1080x1920)
-- Analyst-style write-up
+- Opponent-aware projections (Def + Pace + position)
+- Team-colored metric cards with Model + Confidence
+- Trading-card share image (mobile)
+- Analyst write-up
+- Safe timezone + optional Altair + global guard to avoid blank screen
 """
 
 from __future__ import annotations
@@ -13,28 +14,51 @@ from __future__ import annotations
 import os
 import io
 import json
+import math
 import hashlib
 import datetime as dt
-from zoneinfo import ZoneInfo
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import math
 
 import numpy as np
 import pandas as pd
 import requests
-import altair as alt
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
-# Local modules (keep your existing ones)
+# Optional Altair (fallback to Streamlit native charts if unavailable)
+try:
+    import altair as alt
+    ALT_OK = True
+except Exception:
+    ALT_OK = False
+    alt = None  # type: ignore
+
+# Timezone handling (robust)
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+def get_est_tz():
+    """Robust EST timezone: ZoneInfo if available, else fixed UTC-5."""
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("America/New_York")
+        except Exception:
+            pass
+    return dt.timezone(dt.timedelta(hours=-5), name="EST")
+
+EST_TZ = get_est_tz()
+
+# Local modules (your existing files)
 import data_fetching as dfetch
 from models import ModelManager
 
 
 # =============================================================================
-# CONFIG
+# CONSTANTS / CONFIG
 # =============================================================================
 
 PROP_MAP = {
@@ -75,13 +99,10 @@ N_TRAIN = 60
 MIN_ROWS_FOR_MODEL = 12
 MAX_WORKERS = max(2, min(8, os.cpu_count() or 4))
 
-DATA_DIR = Path("./data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("./data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 FAV_FILE = DATA_DIR / "favorites.json"
 
-
-# =============================================================================
-# TEAM META
-# =============================================================================
 
 TEAM_META: Dict[str, Dict[str, str | int]] = {
     "ATL":{"color":"#E03A3E","nba_id":1610612737,"name":"Hawks"},
@@ -130,10 +151,8 @@ def inject_css():
 <style>
 html, body { font-family: Inter, ui-sans-serif, system-ui; }
 .block-container { padding-top: 1.0rem; max-width: 1240px; }
-h1, h2, h3, h4 {
-  background: linear-gradient(90deg,#e2e8f0 0%, #60a5fa 40%, #34d399 100%);
-  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-}
+h1, h2, h3, h4 { background: linear-gradient(90deg,#e2e8f0 0%, #60a5fa 40%, #34d399 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
 .card { background: rgba(17,24,39,.6); border: 1px solid rgba(255,255,255,.08);
   border-radius: 16px; padding: 18px; box-shadow: 0 10px 30px rgba(0,0,0,.25); backdrop-filter: blur(6px); }
 
@@ -181,35 +200,34 @@ h1, h2, h3, h4 {
 
 
 # =============================================================================
-# UTILS
+# UTILITIES
 # =============================================================================
 
 def _rerun():
     try: st.rerun()
     except Exception: st.experimental_rerun()
 
-def safe_int(v, default=0): 
+def safe_int(v, default=0):
     try:
         if v is None or (isinstance(v,str) and v.strip()=="") or pd.isna(v): return default
         return int(v)
     except Exception:
         return default
 
-def safe_str(v, default=""): 
+def safe_str(v, default=""):
     try:
         if v is None or pd.isna(v): return default
-        s = str(v); return s if s.strip()!="" else default
+        s=str(v); return s if s.strip()!="" else default
     except Exception:
         return default
 
 def clamp(x, lo, hi): return max(lo, min(hi, x))
 
-def show_basketball_loader(placeholder, text):
-    placeholder.markdown(f"""
-<div class="loader-wrap">
-  <div class="loader-text">{text}</div>
-  <div class="court"><div class="ball"></div></div>
-</div>""", unsafe_allow_html=True)
+def show_basketball_loader(ph, text):
+    ph.markdown(f"""
+<div class="loader-wrap"><div class="loader-text">{text}</div>
+<div class="court"><div class="ball"></div></div></div>
+""", unsafe_allow_html=True)
 
 def _hash_frame_small(X: pd.DataFrame, y: np.ndarray, player_id: int, season: str, stat: str) -> str:
     h = hashlib.sha1()
@@ -222,7 +240,6 @@ def _hash_frame_small(X: pd.DataFrame, y: np.ndarray, player_id: int, season: st
     return h.hexdigest()
 
 def season_start_year(season: str) -> int: return int(season.split("-")[0])
-def prev_season(season: str) -> str: s0 = season_start_year(season); return f"{s0-1}-{str(s0)[-2:]}"
 
 
 # =============================================================================
@@ -251,13 +268,15 @@ def get_player_photo_bytes(player_id: int, nba_person_id: Optional[int] = None) 
         "https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/{pid}.png",
         "https://cdn.balldontlie.io/images/headshots/{pid}.png",
     ]
-    s = requests.Session(); s.headers.update({"User-Agent":"Mozilla/5.0 (PropPredictor)"})
+    s = requests.Session(); s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
     for pid in ids:
         for tmpl in url_templates:
             try:
-                r = s.get(tmpl.format(pid=int(pid)), timeout=5)
-                if r.status_code==200 and r.content and len(r.content)>1500: return r.content
-            except Exception: continue
+                r = s.get(tmpl.format(pid=int(pid)), timeout=6)
+                if r.status_code == 200 and r.content and len(r.content) > 1500:
+                    return r.content
+            except Exception:
+                continue
     return None
 
 def _safe_image_from_bytes(photo_bytes: Optional[bytes], size=(220,220)) -> Image.Image:
@@ -280,18 +299,11 @@ def get_logo_or_default(team_abbr: str, size=(128,128)) -> bytes:
     if url:
         try:
             r = requests.get(url, timeout=6)
-            if r.status_code==200 and r.content: return r.content
-        except Exception: pass
+            if r.status_code == 200 and r.content:
+                return r.content
+        except Exception:
+            pass
     return default_placeholder_bytes(size)
-
-def get_photo_or_logo_bytes(fav: dict) -> bytes:
-    pid = safe_int(fav.get("id"),0)
-    nba_pid = fav.get("nba_person_id")
-    nba_pid = None if nba_pid in (None,"",0,pd.NA) else safe_int(nba_pid,None)
-    head = get_player_photo_bytes(pid, nba_pid)
-    if head: return head
-    abbr = safe_str(fav.get("team_abbr"),"")
-    return get_logo_or_default(abbr)
 
 
 # =============================================================================
@@ -397,8 +409,7 @@ def load_player_list_all() -> pd.DataFrame:
         if not p.empty: return p[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
     except Exception: pass
     try:
-        raw2 = requests.get("https://www.balldontlie.io/api/v1/players?per_page=100", timeout=8).json().get("data",[])
-        p2 = normalize_players_df(pd.DataFrame(raw2))
+        raw2 = bdl_fetch_active_players_direct(); p2 = normalize_players_df(raw2)
         if not p2.empty: return p2[["id","full_name","team_id","team_abbr","nba_person_id","position"]]
     except Exception: pass
     return load_player_list("2025-26")
@@ -430,7 +441,8 @@ def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
 def load_team_defense_pace(season: str) -> pd.DataFrame:
     year=season_start_year(season)
     games=_bdl_paginate("https://www.balldontlie.io/api/v1/games", {"seasons[]":year})
-    if not games: return pd.DataFrame(columns=["team_id","abbreviation","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z","DEF_RTG","DEF_RTG_PCT","TIER"])
+    if not games: 
+        return pd.DataFrame(columns=["team_id","abbreviation","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z","DEF_RTG","DEF_RTG_PCT","TIER"])
     rows=[]
     for g in games:
         h=g.get("home_team",{}); v=g.get("visitor_team",{})
@@ -485,19 +497,25 @@ def auto_next_opponent(team_id: int, season: str, team_abbr: Optional[str]=None)
         try: data=_bdl_paginate("https://www.balldontlie.io/api/v1/games", {"seasons[]":year,"team_ids[]":team_id})
         except Exception: data=[]
     if not data: return None
-    def _dt(g): return dt.datetime.fromisoformat(g["date"].replace("Z","+00:00"))
-    now=dt.datetime.now(tz=ZoneInfo("UTC"))-dt.timedelta(hours=6)
+    def _dt(g): 
+        try: return dt.datetime.fromisoformat(g["date"].replace("Z","+00:00"))
+        except Exception: return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+    now=dt.datetime.now(tz=dt.timezone.utc)-dt.timedelta(hours=6)
     future=[g for g in data if _dt(g)>=now]
     if not future: return None
     nxt=sorted(future, key=_dt)[0]
     h,v=nxt.get("home_team",{}),nxt.get("visitor_team",{})
     is_home=(h.get("id")==team_id); opp=v if is_home else h
-    dt_utc=_dt(nxt); dt_est=dt_utc.astimezone(ZoneInfo("America/New_York"))
+    dt_utc=_dt(nxt)
+    try:
+        dt_est=dt_utc.astimezone(EST_TZ)
+    except Exception:
+        dt_est=dt_utc
     return {"opp_id":opp.get("id"),"opp_abbr":opp.get("abbreviation"),"is_home":is_home,"dt_utc":dt_utc,"dt_est":dt_est,"date":dt_est.date()}
 
 
 # =============================================================================
-# FEATURE ENGINEERING
+# FEATURES
 # =============================================================================
 
 def compute_opponent_strength(df: pd.DataFrame) -> pd.DataFrame:
@@ -520,7 +538,7 @@ def attach_defense_pace(df: pd.DataFrame, defense_pace: pd.DataFrame) -> pd.Data
             df[c]=np.nan
         return df
     m=defense_pace.rename(columns={"abbreviation":"OPP_TEAM"})
-    df = df.merge(m[["OPP_TEAM","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z","DEF_RTG","DEF_RTG_PCT"]], on="OPP_TEAM", how="left")
+    df=df.merge(m[["OPP_TEAM","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z","DEF_RTG","DEF_RTG_PCT"]], on="OPP_TEAM", how="left")
     df=df.rename(columns={"PACE":"OPP_PACE","PACE_Z":"OPP_PACE_Z"})
     df["OPP_DEF_X_PACE"]=df["OPP_DEF_Z"]*df["OPP_PACE_Z"]
     return df
@@ -547,7 +565,6 @@ def build_all_features(df_in: pd.DataFrame, season: str) -> pd.DataFrame:
         out[f"{c}_L3"]=out[c].shift(3); out[f"{c}_L5"]=out[c].shift(5)
         out[f"{c}_AVG5"]=pd.Series(s).rolling(5, min_periods=1).mean().to_numpy()
         out[f"{c}_AVG10"]=pd.Series(s).rolling(10, min_periods=1).mean().to_numpy()
-        # light trend proxy:
         out[f"{c}_TREND"]=pd.Series(s).rolling(5, min_periods=5).apply(lambda x: np.polyfit(range(5), x, 1)[0], raw=True)
     for bc in BASE_COLS:
         if bc in out.columns:
@@ -579,7 +596,7 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 def _apply_model_budget(manager: ModelManager, budget: str) -> None:
     if budget=="Full ensemble": return
     if budget=="Lite (3 models)": wanted={"elasticnet","hgb","stack"}
-    else: wanted={"elasticnet"}  # Single (Lasso/EN)
+    else: wanted={"elasticnet"}  # single lightweight
     try:
         if hasattr(manager,"set_model_whitelist"): manager.set_model_whitelist(list(wanted)); return
         if hasattr(manager,"available_models") and isinstance(manager.available_models,list):
@@ -589,12 +606,10 @@ def _apply_model_budget(manager: ModelManager, budget: str) -> None:
     except Exception: pass
 
 def confidence_from_errors(mae: float, mse: float, y_std: float) -> int:
-    # Normalize by target variability to avoid scale bias, then squash.
     if not (np.isfinite(mae) and np.isfinite(mse) and y_std>0): return 55
     rmse = math.sqrt(max(mse, 0.0))
     score = 1.0 - 0.5*(mae/y_std) - 0.5*(rmse/y_std)
-    conf = int(clamp(score, 0.10, 0.97) * 100)
-    return conf
+    return int(clamp(score, 0.10, 0.97) * 100)
 
 def get_or_train_model_cached(player_id: int, season: str, stat: str, X: pd.DataFrame, y: np.ndarray, budget: str) -> ModelManager:
     key = _hash_frame_small(X, y, player_id, season, stat) + f"|{budget}"
@@ -659,7 +674,6 @@ def adjust_predictions(results: List[Dict], opp_row: Optional[pd.Series], positi
             weight = w.get(PROP_MAP[stat] if isinstance(PROP_MAP[stat], str) else stat, 1.0)
             mult = (1 - alpha_def * z * weight) * (1 + beta_pace * pace_z)
             base[stat]["pred"] = max(0.0, base[stat]["pred"] * mult)
-            # small confidence haircut when strong adjustment
             base[stat]["conf"] = int(clamp(base[stat]["conf"] * (1 - 0.05*abs(z)), 30, 99))
 
     def derive(name, parts):
@@ -681,7 +695,7 @@ def adjust_predictions(results: List[Dict], opp_row: Optional[pd.Series], positi
 
 
 # =============================================================================
-# SHARE IMAGE & UI HELPERS
+# UI HELPERS / SHARE IMAGE / CHARTS
 # =============================================================================
 
 def get_font(size: int):
@@ -709,14 +723,14 @@ def results_to_table(results: List[Dict]) -> pd.DataFrame:
     df["Pred"] = pd.to_numeric(df["Prediction"], errors="coerce").round(2)
     if "Confidence" in df.columns: df["Conf%"] = df["Confidence"].astype(int)
     if "Model" in df.columns: df["Model"] = df["Model"].astype(str)
-    cols = ["Stat","Pred"] + ([ "Conf%","Model"] if "Confidence" in df.columns else [])
+    cols = ["Stat","Pred","Conf%","Model"] if "Confidence" in df.columns else ["Stat","Pred"]
     return df[cols]
 
 def render_metric_cards(results: List[Dict], team_color: str):
     base = team_color or "#60a5fa"; soft = lighten_hex(base, 0.55)
     ordered = sorted(results, key=lambda r: BOX_SCORE_ORDER.index(r["Stat"]) if r["Stat"] in BOX_SCORE_ORDER else 999)
     html=['<div class="metric-grid">']
-    for i,r in enumerate(ordered):
+    for r in ordered:
         stat=str(r["Stat"])
         pred = f'{float(r["Prediction"]):.2f}' if np.isfinite(r["Prediction"]) else "—"
         model = r.get("Model","")
@@ -730,6 +744,28 @@ def render_metric_cards(results: List[Dict], team_color: str):
 </div>""")
     html.append("</div>")
     st.markdown("\n".join(html), unsafe_allow_html=True)
+
+def bar_chart_from_table(df: pd.DataFrame, title: str):
+    if ALT_OK:
+        order = [s for s in BOX_SCORE_ORDER if s in df["Stat"].unique().tolist()]
+        c = alt.Chart(df).mark_bar().encode(
+            x=alt.X("Stat:N", sort=order), y=alt.Y("Pred:Q"), tooltip=["Stat","Pred"],
+        ).properties(height=280, title=title)
+        st.altair_chart(c, use_container_width=True)
+    else:
+        st.bar_chart(df.set_index("Stat")["Pred"], height=280)
+
+def line_chart_from_long(long_df: pd.DataFrame, title: str):
+    if ALT_OK:
+        c = alt.Chart(long_df).mark_line().encode(
+            x="GAME_DATE:T", y="Val:Q", color=alt.Color("Stat:N"), tooltip=["GAME_DATE:T","Stat:N","Val:Q"],
+        ).properties(height=220, title=title)
+        st.altair_chart(c, use_container_width=True)
+    else:
+        wide = long_df.pivot(index="GAME_DATE", columns="Stat", values="Val").sort_index()
+        st.line_chart(wide, height=220)
+
+def get_font_png_title(size:int)->ImageFont.ImageFont: return get_font(size)
 
 def make_share_image_trading_card(
     player_name: str, team_abbr: str, team_name: str, team_color: str,
@@ -756,9 +792,524 @@ def make_share_image_trading_card(
     mask=Image.new("L",(540,540),0); ImageDraw.Draw(mask).ellipse((0,0,540,540), fill=255)
     head.putalpha(mask); bg.paste(head,(270,160),head)
 
-    f_title=get_font(72); f_sub=get_font(42); f_small=get_font(36)
+    f_title=get_font_png_title(72); f_sub=get_font(42); f_small=get_font(36)
     f_metric=get_font(84); f_metric_title=get_font(40)
 
     card=Image.new("RGBA",(980,1080),(16,22,36,245))
     cd=ImageDraw.Draw(card)
-    cd.rounded_rectangle([0,0,980,1080], radius=34, outline=(255,255,255,))
+    cd.rounded_rectangle([0,0,980,1080], radius=34, outline=(255,255,255,50), width=2)
+    cd.rectangle([0,0,980,146], fill=(r,g,b,235))
+    cd.text((28,24), f"{player_name}", fill=(255,255,255), font=f_title)
+    cd.text((28,92), f"{team_name} ({team_abbr})  •  {season}  •  {title_suffix}", fill=(245,248,255), font=f_sub)
+    cd.text((28,132), next_info, fill=(225,232,247), font=f_small)
+
+    stats_show=[s for s in BOX_SCORE_ORDER if s in df_table["Stat"].tolist()][:8]
+    grid=[]
+    for s in stats_show:
+        val=df_table[df_table["Stat"]==s]["Pred"].values
+        pred=f"{float(val[0]):.1f}" if len(val) else "—"
+        grid.append((s,pred))
+    x0,y0=40,190; w,h=430,170; gap_x,gap_y=40,34
+    for i,(s,pred) in enumerate(grid):
+        cx=x0+(i%2)*(w+gap_x); cy=y0+(i//2)*(h+gap_y)
+        cd.rounded_rectangle([cx,cy,cx+w,cy+h], radius=20, fill=(12,16,28,255), outline=(255,255,255,34), width=2)
+        cd.text((cx+18,cy+16), s, fill=(208,218,242), font=f_metric_title)
+        cd.text((cx+18,cy+72), pred, fill=(255,255,255), font=f_metric)
+
+    bg.paste(card,(50,720),card)
+    buf=io.BytesIO(); bg.save(buf, format="PNG", optimize=True); return buf.getvalue()
+
+
+# =============================================================================
+# ANALYST BLURB
+# =============================================================================
+
+def analyst_blurb(name: str, team_name: str, opp_txt: str, results: List[Dict], opp_row: Optional[pd.Series], position: str) -> str:
+    pts = next((r["Prediction"] for r in results if r["Stat"]=="Points"), np.nan)
+    reb = next((r["Prediction"] for r in results if r["Stat"]=="Rebounds"), np.nan)
+    ast = next((r["Prediction"] for r in results if r["Stat"]=="Assists"), np.nan)
+    tier = safe_str(opp_row.get("TIER"), "Average") if opp_row is not None else "Average"
+    pace = float(opp_row.get("PACE_Z",0)) if opp_row is not None else 0.0
+    pace_note = "up-tempo" if pace>0.4 else ("methodical" if pace<-0.4 else "neutral-pace")
+    role = "guard" if "G" in (position or "") else ("center" if "C" in (position or "") else "forward")
+    pts_s = f"{pts:.1f}" if np.isfinite(pts) else "—"
+    reb_s = f"{reb:.1f}" if np.isfinite(reb) else "—"
+    ast_s = f"{ast:.1f}" if np.isfinite(ast) else "—"
+    return (
+        f"{name} projects for **{pts_s} PTS, {reb_s} REB, {ast_s} AST** in {team_name}'s next matchup. "
+        f"The opponent grades **{tier.lower()}** defensively and plays at a **{pace_note}** pace, modestly impacting the median outcome. "
+        f"Usage and recent trends are accounted for in the model; expect production to cluster around these marks barring role changes. "
+        f"{opp_txt}"
+    )
+
+
+# =============================================================================
+# SAFE PICKER
+# =============================================================================
+
+def pick_player_row(players: pd.DataFrame, selected_name: str) -> Optional[pd.Series]:
+    if players is None or players.empty: return None
+    arr = players["full_name"].astype(str).values
+    idx = np.where(arr == str(selected_name))[0]
+    return players.iloc[int(idx[0])] if idx.size else None
+
+
+# =============================================================================
+# PAGES — PREDICT
+# =============================================================================
+
+def _opp_line(next_game: Optional[Dict], dp: pd.DataFrame) -> Tuple[str, Optional[pd.Series]]:
+    if not next_game: return "Next: N/A", None
+    row = dp[dp["abbreviation"]==next_game["opp_abbr"]].head(1)
+    if row.empty:
+        side="Home" if next_game["is_home"] else "Away"
+        when=next_game["dt_est"].strftime("%a, %b %d %I:%M %p ET")
+        return f"Next: {side} vs {next_game['opp_abbr']} — {when}", None
+    r=row.iloc[0]; side="Home" if next_game["is_home"] else "Away"
+    when=next_game["dt_est"].strftime("%a, %b %d %I:%M %p ET")
+    txt=f"Next: {side} vs {next_game['opp_abbr']} — {when} • DefRtg {r['DEF_RTG']:.1f} ({r['TIER']})"
+    return txt, r
+
+def page_predict(players: pd.DataFrame):
+    st.header("NBA Prop Predictor — Elite")
+
+    if players is None or players.empty:
+        st.error("No active players available. Use **Refresh players** in the sidebar and try again."); return
+
+    names = ["— Select Player —"] + players["full_name"].astype(str).tolist()
+    colL,colR = st.columns([1,3])
+    with colL:
+        name = st.selectbox("Select Player", names, index=0, key="predict_player")
+        if name == "— Select Player —":
+            st.info("Pick a player to continue."); return
+        row = pick_player_row(players, name)
+        if row is None: st.error("Could not resolve player."); return
+        player_id = safe_int(row.get("id"),0)
+        team_abbr = safe_str(row.get("team_abbr"),"")
+        position = safe_str(row.get("position"),"")
+        team_meta = TEAM_META.get(team_abbr,{})
+        team_name = team_meta.get("name", team_abbr or "")
+        team_color = team_meta.get("color","#60a5fa")
+        team_logo = nba_logo_url(team_abbr)
+        run = st.button("Get Projections")
+    with colR:
+        nba_pid = None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"), None)
+        st.image(_safe_image_from_bytes(get_player_photo_bytes(player_id, nba_pid),(240,240)), caption=name)
+        if team_logo or team_name:
+            c1,c2 = st.columns([1,5])
+            with c1:
+                if team_logo: st.image(team_logo, width=64)
+            with c2:
+                st.markdown(f"**Team:** {team_name} ({team_abbr})")
+
+    if not run:
+        st.info("Click **Get Projections** to compute."); return
+
+    season="2025-26"
+    logs=load_logs(player_id, season)
+    if logs.empty:
+        y=dt.date.today().year; fallback=f"{y-1}-{str(y)[-2:]}"
+        logs=load_logs(player_id, fallback); season=fallback
+    if logs.empty:
+        st.error("No game logs found."); return
+
+    team_id_resolved, abbr_resolved = resolve_team_for_player(row, logs)
+    dp = load_team_defense_pace(season)
+    next_game = auto_next_opponent(team_id_resolved, season, abbr_resolved)
+    ph = st.empty(); show_basketball_loader(ph, "Building features…")
+    features = build_all_features(logs, season); ph.empty()
+
+    upcoming_ctx={}; opp_row=None
+    if next_game:
+        txt, opp_row = _opp_line(next_game, dp)
+        if opp_row is not None:
+            upcoming_ctx.update({
+                "OPP_DEF_PPG":float(opp_row["OPP_DEF_PPG"]),"OPP_DEF_Z":float(opp_row["OPP_DEF_Z"]),
+                "OPP_PACE":float(opp_row["PACE"]),"OPP_PACE_Z":float(opp_row["PACE_Z"]),
+                "OPP_DEF_X_PACE":float(opp_row["OPP_DEF_Z"]*opp_row["PACE_Z"]),
+                "DEF_RTG":float(opp_row["DEF_RTG"]),"DEF_RTG_PCT":float(opp_row["DEF_RTG_PCT"]),
+            })
+        upcoming_ctx["IS_HOME"]=1 if next_game and next_game["is_home"] else 0
+    else:
+        txt, opp_row = "Next: N/A", None
+    st.markdown(f'<span class="badge">{txt}</span>', unsafe_allow_html=True)
+
+    fast_mode=False; model_budget="Single (Lasso)"
+    ph2 = st.empty(); show_basketball_loader(ph2, "Computing projections…")
+    futures, results = {}, []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for stat in PROP_MAP.keys():
+            futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode, model_budget, upcoming_ctx)] = stat
+        for fut in as_completed(futures): results.append(fut.result())
+    ph2.empty()
+    results = adjust_predictions(results, opp_row, position)
+
+    st.subheader("Projected Props")
+    render_metric_cards(results, TEAM_META.get(team_abbr,{}).get("color","#60a5fa"))
+    df_table = results_to_table(results)
+    st.download_button("⬇️ Download CSV", data=df_table.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{name.replace(' ','_')}_{season}_projections.csv", mime="text/csv")
+
+    st.markdown("---")
+    st.markdown("#### Analyst Notes")
+    st.write(analyst_blurb(name, team_name, txt, results, opp_row, position))
+
+    logo_bytes=get_logo_or_default(team_abbr) if team_abbr else None
+    photo=get_player_photo_bytes(player_id, None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"),None))
+    img_bytes = make_share_image_trading_card(
+        player_name=name, team_abbr=team_abbr, team_name=team_name,
+        team_color=TEAM_META.get(team_abbr,{}).get("color","#60a5fa"),
+        season=season, next_info=txt, photo_bytes=photo, logo_bytes=logo_bytes,
+        df_table=df_table[["Stat","Pred"]], title_suffix="Projections",
+    )
+    st.download_button("📸 Share image (PNG, mobile)", data=img_bytes,
+                       file_name=f"{name.replace(' ','_')}_{season}_card.png", mime="image/png")
+
+    st.markdown("---"); st.subheader("Recent Games")
+    cols=[c for c in ["GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in logs.columns]
+    st.dataframe(logs[cols], use_container_width=True)
+
+
+# =============================================================================
+# FAVORITES
+# =============================================================================
+
+def _mini_metrics_html(df_table: pd.DataFrame) -> str:
+    order=[s for s in BOX_SCORE_ORDER if s in df_table["Stat"].tolist()]
+    vals={r["Stat"]: r["Pred"] for _,r in df_table.iterrows()}
+    chips=[]
+    for s in order:
+        v=vals.get(s,None)
+        if v is None or (isinstance(v,float) and np.isnan(v)): continue
+        chips.append(f'<div class="mm"><div class="t">{s}</div><div class="v">{v:.1f}</div></div>')
+    return f'<div class="mm-wrap">{"".join(chips)}</div>'
+
+def page_favorites(players: pd.DataFrame):
+    st.header("Favorites")
+    if players is None or players.empty:
+        st.error("No active players available to add."); return
+
+    favs=_load_favorites()
+    col1,col2 = st.columns([3,1])
+    with col1:
+        options=["— Select Player —"] + players["full_name"].astype(str).tolist()
+        name=st.selectbox("Add a player", options, key="fav_add_sel", index=0)
+    with col2:
+        if st.button("➕ Add"):
+            if name=="— Select Player —": st.warning("Pick a player first.")
+            else:
+                row=pick_player_row(players, name)
+                if row is None: st.error("Could not resolve the selected player.")
+                else:
+                    pid=safe_int(row.get("id"),0)
+                    nba_pid=None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"),None)
+                    team_id=safe_int(row.get("team_id"),0); team_abbr=safe_str(row.get("team_abbr"),"")
+                    position=safe_str(row.get("position"),"")
+                    if not any(f["id"]==pid for f in favs):
+                        favs.append({"id":pid,"full_name":name,"team_id":team_id,"team_abbr":team_abbr,"nba_person_id":nba_pid,"position":position})
+                        _save_favorites(favs); st.success("Added.")
+                    else: st.info("Already in favorites.")
+
+    if not favs:
+        st.info("No favorites yet."); return
+
+    st.subheader("Saved favorites")
+    season="2025-26"; dp=load_team_defense_pace(season)
+    all_rows=[]
+    for f in list(favs):
+        pid=safe_int(f.get("id"),0); pname=safe_str(f.get("full_name"),"")
+        abbr=safe_str(f.get("team_abbr"),""); position=safe_str(f.get("position"),"")
+        nba_pid=f.get("nba_person_id"); nba_pid=None if nba_pid in (None,"",0) else safe_int(nba_pid,None)
+        photo=get_player_photo_bytes(pid, nba_pid)
+        color=TEAM_META.get(abbr,{}).get("color","#60a5fa"); team_name=TEAM_META.get(abbr,{}).get("name",abbr or "")
+
+        logs=load_logs(pid,season)
+        if logs.empty:
+            y=dt.date.today().year; fb=f"{y-1}-{str(y)[-2:]}"
+            logs=load_logs(pid,fb)
+        if logs.empty:
+            st.warning(f"No logs for {pname}."); continue
+        feats=build_all_features(logs, season)
+        team_id_resolved, abbr_resolved = resolve_team_for_player(pd.Series(f), logs)
+        next_game = auto_next_opponent(team_id_resolved, season, abbr_resolved)
+        txt, opp_row = _opp_line(next_game, dp) if next_game else ("Next: N/A", None)
+        upcoming_ctx={}
+        if opp_row is not None:
+            upcoming_ctx.update({
+                "OPP_DEF_PPG":float(opp_row["OPP_DEF_PPG"]),"OPP_DEF_Z":float(opp_row["OPP_DEF_Z"]),
+                "OPP_PACE":float(opp_row["PACE"]),"OPP_PACE_Z":float(opp_row["PACE_Z"]),
+                "OPP_DEF_X_PACE":float(opp_row["OPP_DEF_Z"]*opp_row["PACE_Z"]),
+                "DEF_RTG":float(opp_row["DEF_RTG"]),"DEF_RTG_PCT":float(opp_row["DEF_RTG_PCT"]),
+            })
+        futures,res={},[]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            for stat in PROP_MAP.keys():
+                futures[ex.submit(train_predict_for_stat, pid, season, stat, feats, False, "Single (Lasso)", upcoming_ctx)] = stat
+            for fut in as_completed(futures): res.append(fut.result())
+        res=adjust_predictions(res, opp_row, position)
+        df_table=results_to_table(res)
+        df_all=df_table.copy(); df_all.insert(0,"Player",pname); df_all.insert(1,"Season",season); all_rows.append(df_all)
+
+        with st.container():
+            st.markdown('<div class="fav-box">', unsafe_allow_html=True)
+            c1,c2=st.columns([1,5])
+            with c1: st.image(_safe_image_from_bytes(photo,(84,84)), use_column_width=False)
+            with c2:
+                st.markdown(f"<div class='fav-name'>{pname} — {team_name}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='fav-meta'>{txt}</div>", unsafe_allow_html=True)
+                st.markdown(_mini_metrics_html(df_table), unsafe_allow_html=True)
+                cshare, ccsv, cdel = st.columns([1,1,1])
+                with cshare:
+                    share_bytes = make_share_image_trading_card(
+                        player_name=pname, team_abbr=abbr, team_name=team_name, team_color=color,
+                        season=season, next_info=txt, photo_bytes=photo, logo_bytes=get_logo_or_default(abbr),
+                        df_table=df_table[["Stat","Pred"]], title_suffix="Projections",
+                    )
+                    st.download_button("📸 Share", data=share_bytes, file_name=f"{pname.replace(' ','_')}_{season}_card.png", mime="image/png", key=f"sh_{pid}")
+                with ccsv:
+                    st.download_button("⬇️ CSV", data=df_all.to_csv(index=False).encode("utf-8"),
+                                       file_name=f"{pname.replace(' ','_')}_{season}_projections.csv", mime="text/csv", key=f"csv_{pid}")
+                with cdel:
+                    st.markdown("<div class='fav-x'>", unsafe_allow_html=True)
+                    if st.button("❌", key=f"del_{pid}", help="Remove"):
+                        favs=[x for x in favs if safe_int(x.get("id"),0)!=pid]; _save_favorites(favs); _rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+    if all_rows:
+        all_df=pd.concat(all_rows, ignore_index=True)
+        st.subheader("Export all favorites")
+        st.dataframe(all_df, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Download ALL as CSV", data=all_df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"favorites_{season}_projections.csv", mime="text/csv")
+
+
+# =============================================================================
+# RESEARCH
+# =============================================================================
+
+def fetch_logs_multi(player_id: int, seasons: List[str]) -> pd.DataFrame:
+    frames=[]
+    for s in seasons:
+        try:
+            g=load_logs(player_id,s)
+            if not g.empty:
+                g=g.copy(); g["SEASON"]=s; frames.append(g)
+        except Exception: continue
+    if not frames: return pd.DataFrame()
+    df=pd.concat(frames, ignore_index=True)
+    if "GAME_DATE" in df.columns:
+        df["GAME_DATE"]=pd.to_datetime(df["GAME_DATE"], errors="coerce")
+        df=df.sort_values(["SEASON","GAME_DATE"])
+    return df
+
+def _window_avg(df: pd.DataFrame, n: int) -> Tuple[pd.DataFrame,pd.DataFrame]:
+    if df.empty: return pd.DataFrame(), pd.DataFrame()
+    d=df.copy(); d["GAME_DATE"]=pd.to_datetime(d["GAME_DATE"], errors="coerce"); d=d.sort_values("GAME_DATE")
+    w=d.tail(n).copy(); 
+    if w.empty: return w, pd.DataFrame()
+    avg=w[["PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"]].mean().to_frame("Avg").T.round(2)
+    return w, avg
+
+def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
+    if df_w is None or df_w.empty or "GAME_DATE" not in df_w.columns: return
+    value_cols=[c for c in ["PTS","REB","AST"] if c in df_w.columns]
+    if not value_cols: return
+    df_w=df_w.copy(); df_w["GAME_DATE"]=pd.to_datetime(df_w["GAME_DATE"], errors="coerce")
+    df_w=df_w.dropna(subset=["GAME_DATE"]); 
+    if df_w.empty: return
+    base=df_w[["GAME_DATE"]+value_cols]
+    if base[value_cols].notna().sum().sum()==0: return
+    long=base.melt(id_vars=["GAME_DATE"], var_name="Stat", value_name="Val").dropna(subset=["Val"])
+    if long.empty: return
+    if ALT_OK:
+        line_chart_from_long(long, f"{title_prefix} — Trends")
+        avg_long=long.groupby("Stat",as_index=False)["Val"].mean()
+        bar_chart_from_table(avg_long.rename(columns={"Val":"Pred"}), f"{title_prefix} — Averages")
+    else:
+        line_chart_from_long(long, f"{title_prefix} — Trends")
+        avg_long=long.groupby("Stat",as_index=False)["Val"].mean()
+        bar_chart_from_table(avg_long.rename(columns={"Val":"Pred"}), f"{title_prefix} — Averages")
+
+def make_research_share_image_trading_card(player_name: str, team_abbr: str, team_name: str, team_color: str,
+                                           title_suffix: str, photo_bytes: Optional[bytes], logo_bytes: Optional[bytes],
+                                           df_metrics: pd.DataFrame) -> bytes:
+    return make_share_image_trading_card(player_name, team_abbr, team_name, team_color, title_suffix, "Research view",
+                                         photo_bytes, logo_bytes, df_metrics, title_suffix="Research")
+
+def page_research():
+    st.header("Research"); st.caption("Recent performance + rolling windows.")
+    all_players=load_player_list_all()
+    if all_players.empty: st.error("Could not load player index."); return
+    options=["— Select Player —"] + all_players["full_name"].astype(str).tolist()
+    name=st.selectbox("Choose player", options, index=0, key="research_pick")
+    if name=="— Select Player —": st.info("Pick a player to load research."); return
+
+    row=pick_player_row(all_players, name)
+    if row is None: st.info("Select a player to continue."); return
+
+    pid=safe_int(row.get("id"),0)
+    nba_pid=None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"),None)
+    abbr=safe_str(row.get("team_abbr"),"")
+    team_meta=TEAM_META.get(abbr,{}); color=team_meta.get("color","#60a5fa"); team_name=team_meta.get("name",abbr or "")
+    team_logo=nba_logo_url(abbr)
+
+    colA,colB=st.columns([1,3])
+    with colA: st.image(_safe_image_from_bytes(get_player_photo_bytes(pid, nba_pid),(220,220)), caption=name)
+    with colB:
+        if team_logo: st.image(team_logo, width=64)
+        st.markdown(f"**Team:** {team_name} ({abbr})")
+        run=st.button("Load player data")
+    if not run:
+        st.info("Click **Load player data**."); return
+
+    ph=st.empty(); show_basketball_loader(ph, "Loading logs across seasons…")
+    seasons_all=[f"{y}-{str(y+1)[-2:]}" for y in range(2000, dt.date.today().year+1)]
+    logs=fetch_logs_multi(pid, seasons_all); ph.empty()
+    if logs.empty: st.warning("No logs found."); return
+
+    st.subheader("Most Recent Performance (Last Game Played)")
+    lg=logs.copy().sort_values("GAME_DATE"); last=lg.tail(1)
+    cols=[c for c in ["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in last.columns]
+    st.dataframe(last[cols], use_container_width=True, hide_index=True)
+
+    def _section(label: str, n: int):
+        w,avg=_window_avg(lg,n); st.markdown(f"### {label} Averages")
+        if not avg.empty:
+            st.dataframe(avg.assign(**{"Games": len(w)}), use_container_width=True, hide_index=True)
+            with st.expander("Details"):
+                sh=[c for c in ["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in w.columns]
+                st.dataframe(w[sh], use_container_width=True, hide_index=True)
+                _charts_for_window(w, label, color)
+        else: st.info("Not enough games.")
+    _section("Last 5 Games",5); _section("Last 10 Games",10); _section("Last 20 Games",20)
+
+    w10,avg10=_window_avg(lg,10)
+    if not avg10.empty:
+        table=avg10.T.reset_index().rename(columns={"index":"Stat","Avg":"Pred"})
+        table["Stat"]=table["Stat"].map({"PTS":"Points","REB":"Rebounds","AST":"Assists","FG3M":"3PM","STL":"Steals","BLK":"Blocks","TOV":"Turnovers","MIN":"Minutes"})
+        logo_bytes=get_logo_or_default(abbr)
+        share_bytes=make_research_share_image_trading_card(name, abbr, team_name, color, "L10 Averages",
+                                                           get_player_photo_bytes(pid, nba_pid), logo_bytes, table[["Stat","Pred"]])
+        st.download_button("📸 Share image (PNG, mobile)", data=share_bytes, file_name=f"{name.replace(' ','_')}_research_card.png", mime="image/png")
+
+
+# =============================================================================
+# SLATE
+# =============================================================================
+
+@st.cache_data(show_spinner=False)
+def fetch_todays_games(season: str) -> pd.DataFrame:
+    year = season_start_year(season)
+    today = dt.date.today()
+    start = today.isoformat(); end = (today + dt.timedelta(days=1)).isoformat()
+    try:
+        data = _bdl_paginate("https://www.balldontlie.io/api/v1/games",
+                             {"seasons[]": year, "start_date": start, "end_date": end})
+        if not data: return pd.DataFrame()
+        rows=[]
+        for g in data:
+            try:
+                dt_utc = dt.datetime.fromisoformat(g["date"].replace("Z","+00:00"))
+            except Exception:
+                dt_utc = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+            try:
+                dt_est = dt_utc.astimezone(EST_TZ)
+            except Exception:
+                dt_est = dt_utc
+            h=g["home_team"]; v=g["visitor_team"]
+            rows.append({
+                "when_est": dt_est, "home": h["abbreviation"], "away": v["abbreviation"],
+                "home_id": h["id"], "away_id": v["id"], "status": g.get("status",""),
+            })
+        df = pd.DataFrame(rows)
+        return df.sort_values("when_est")
+    except Exception:
+        return pd.DataFrame()
+
+def page_slate(players: pd.DataFrame):
+    st.header("Slate — Today")
+    season="2025-26"
+    dp = load_team_defense_pace(season)
+    games = fetch_todays_games(season)
+    if games.empty:
+        st.info("No scheduled games found for today.")
+        return
+
+    for _, g in games.iterrows():
+        when = g["when_est"].strftime("%a, %b %d %I:%M %p ET")
+        h_abbr, a_abbr = g["home"], g["away"]
+        h_row = dp[dp["abbreviation"]==h_abbr].head(1)
+        a_row = dp[dp["abbreviation"]==a_abbr].head(1)
+        h_tier = h_row["TIER"].iloc[0] if not h_row.empty else "—"
+        a_tier = a_row["TIER"].iloc[0] if not a_row.empty else "—"
+        st.markdown(f"**{a_abbr} @ {h_abbr}** • {when}  —  Home DEF: *{h_tier}* | Away DEF: *{a_tier}*")
+
+        rosters = {
+            h_abbr: players[players["team_abbr"]==h_abbr]["full_name"].tolist(),
+            a_abbr: players[players["team_abbr"]==a_abbr]["full_name"].tolist(),
+        }
+        c1,c2,c3 = st.columns([2,2,1])
+        with c1:
+            pick_h = st.selectbox(f"{h_abbr} player", ["—"] + rosters[h_abbr], key=f"sl_{h_abbr}_{when}_h")
+        with c2:
+            pick_a = st.selectbox(f"{a_abbr} player", ["—"] + rosters[a_abbr], key=f"sl_{a_abbr}_{when}_a")
+        with c3:
+            if st.button("Open in Predict", key=f"go_{h_abbr}_{a_abbr}_{when}"):
+                name = pick_h if pick_h!="—" else (pick_a if pick_a!="—" else None)
+                if name:
+                    st.session_state["predict_player"] = name
+                    st.session_state["sidebar_page"] = "Predict"
+                    _rerun()
+        st.markdown("---")
+
+
+# =============================================================================
+# APP GUARD
+# =============================================================================
+
+def run_app_guarded(fn):
+    try:
+        fn()
+    except Exception as e:
+        st.error("Unexpected error. See details below.")
+        st.exception(e)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    st.set_page_config(page_title="NBA Prop Predictor — Elite", page_icon="🏀", layout="wide")
+    inject_css()
+
+    with st.sidebar:
+        st.markdown("## Navigation")
+        pages = ["Predict","Favorites","Research","Slate"]
+        default = st.session_state.get("sidebar_page","Predict")
+        page = st.radio("Go to", pages, index=pages.index(default) if default in pages else 0, key="sidebar_page")
+        st.markdown("---")
+        if st.button("🔄 Refresh players"):
+            load_player_list.clear(); load_player_list_all.clear()
+            st.session_state["sidebar_page"] = page
+            _rerun()
+        st.markdown('<span class="tag">Projections</span> <span class="tag">Research</span> <span class="tag">Slate</span>', unsafe_allow_html=True)
+        if not ALT_OK:
+            st.caption("Charts fallback active (Altair not installed).")
+
+    players = load_player_list("2025-26")
+
+    if page == "Predict":
+        page_predict(players)
+    elif page == "Favorites":
+        page_favorites(players)
+    elif page == "Research":
+        page_research()
+    else:
+        page_slate(players)
+
+
+if __name__ == "__main__":
+    run_app_guarded(main)
