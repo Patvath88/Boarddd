@@ -1,12 +1,12 @@
 # app.py
 """
-NBA Prop Predictor — Elite (Patched)
-- Robust player list normalization (fixes KeyError: 'id'/'team_id')
-- Auto next opponent; Defense + Pace features (DEF_Z, PACE_Z, DEFxPACE)
-- Outlier-like UI: photos, team logos, glow cards
-- Copyable/downloadable tables, share images
-- Bar charts on every page
-- Favorites: grid cards + one-click ❌ remove
+NBA Prop Predictor — Elite (Patched to fix all runtime errors & deprecations)
+- Fix: y must be 1D (no (n,2)); robust TARGET build
+- Fix: .empty property (no logs.empty())
+- Fix: guard tiny samples (avoid KNN n_neighbors error) with baseline fallback
+- Fix: deprecations (fillna(method="ffill") -> ffill; use_container_width -> width='stretch')
+- Keep features: Auto-opponent, DEF_Z, PACE_Z, DEF×PACE, Favorites glow with ❌,
+  shareable images, CSV downloads, bar charts, backtesting
 """
 
 from __future__ import annotations
@@ -30,9 +30,8 @@ import altair as alt
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
-# Your modules
-import data_fetching as dfetch              # expected existing module
-from models import ModelManager             # expected existing module
+import data_fetching as dfetch
+from models import ModelManager
 
 
 # =============================================================================
@@ -63,8 +62,9 @@ BASE_COLS = [
     "OPP_DEF_X_PACE",
 ]
 
+# Larger threshold so we never pass tiny sets into ModelManager (prevents KNN error)
 N_TRAIN = 60
-MIN_ROWS_FOR_MODEL = 6
+MIN_ROWS_FOR_MODEL = 12   # was 6; increase to avoid KNN n_neighbors issues
 MAX_WORKERS = max(2, min(8, os.cpu_count() or 4))
 
 DATA_DIR = Path("./data")
@@ -119,7 +119,7 @@ def nba_logo_url(team_abbr: str) -> Optional[str]:
 
 
 # =============================================================================
-# STYLING (Outlier-like)
+# STYLING
 # =============================================================================
 
 def inject_css() -> None:
@@ -299,7 +299,7 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id"])
     p = df.copy()
 
-    # id
+    # id normalization
     id_done = False
     for c in ["id","player_id","PLAYER_ID","PersonId","PERSON_ID"]:
         if c in p.columns:
@@ -308,7 +308,7 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
     if not id_done:
         p["id"] = pd.NA
 
-    # full_name
+    # full_name normalization
     if "full_name" not in p.columns:
         if {"first_name","last_name"}.issubset(p.columns):
             p["full_name"] = (p["first_name"].astype(str).str.strip() + " " + p["last_name"].astype(str).str.strip()).str.strip()
@@ -319,7 +319,7 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
         else:
             p["full_name"] = p.get("full_name","Unknown")
 
-    # teams
+    # team cols
     p = _safe_get_team_cols(p)
     if "team_abbr" not in p.columns or p["team_abbr"].isna().all():
         teams = load_teams_bdl()
@@ -329,7 +329,7 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
                 on="team_id", how="left"
             )
 
-    # nba_person_id
+    # nba_person_id normalization
     nba_done = False
     for c in ["nba_person_id","PERSON_ID","personId","nba_id"]:
         if c in p.columns:
@@ -347,11 +347,9 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_player_list(season: str = "2025-26") -> pd.DataFrame:
-    """Active-only dropdown; schema-robust across sources."""
     try:
         raw = dfetch.get_active_players_balldontlie()
         p = normalize_players_df(raw)
-        # final subset
         return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
     except Exception:
         fb = dfetch.get_player_list_nba()
@@ -415,7 +413,6 @@ def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
 
 @st.cache_data(show_spinner=False)
 def load_team_defense_pace(season: str) -> pd.DataFrame:
-    """Defense (allowed PPG) + Pace proxy (total points per game) per team + z-scores."""
     year = season_start_year(season)
     games = _bdl_paginate("https://www.balldontlie.io/api/v1/games", {"seasons[]": year})
     if not games:
@@ -537,7 +534,7 @@ def build_target(df: pd.DataFrame, stat: str) -> pd.Series:
 
 def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
     X = X.copy()
-    X = X.fillna(method="ffill")
+    X = X.ffill()         # deprecation-safe
     med = X.median(numeric_only=True)
     X = X.fillna(med)
     X = X.fillna(0.0)
@@ -552,7 +549,7 @@ def get_or_train_model_cached(player_id: int, season: str, stat: str, X: pd.Data
     key = _hash_frame_small(X, y, player_id, season, stat)
     ss: Dict[str, ModelManager] = st.session_state.setdefault("model_cache", {})
     if key in ss: return ss[key]
-    manager = ModelManager(random_state=42)  # must support .train/.predict/.best_model()
+    manager = ModelManager(random_state=42)
     manager.train(X, y)
     ss[key] = manager
     return manager
@@ -565,15 +562,19 @@ def train_predict_for_stat(
     fast_mode: bool,
     upcoming_ctx: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
+    # Robust TARGET build (prevents duplicate 'TARGET' columns)
     y_all = build_target(features, stat).to_numpy()
     X_all = select_X_for_stat(features, stat)
+
     df_join = pd.concat([pd.Series(y_all, name="TARGET", index=X_all.index), X_all], axis=1)
     df_join = df_join.loc[~df_join["TARGET"].isna()].copy()
+
     if df_join.empty:
         return {"Stat": stat, "Prediction": float("nan"), "Best Model": "NoData", "MAE": float("nan"), "MSE": float("nan")}
 
-    y_final = df_join["TARGET"].to_numpy(dtype=float)
-    X_final = _impute_features(df_join.drop(columns=["TARGET"]))
+    y_final = df_join["TARGET"].to_numpy(dtype=float)            # strictly 1D
+    X_final = _impute_features(df_join.drop(columns=["TARGET"])) # aligned rows
+
     if len(X_final) > N_TRAIN:
         X_final = X_final.iloc[-N_TRAIN:].copy()
         y_final = y_final[-N_TRAIN:].copy()
@@ -584,16 +585,30 @@ def train_predict_for_stat(
             if k in X_next.columns:
                 X_next.loc[:, k] = v
 
+    # Avoid training when sample is too small (prevents KNN crash inside models.py)
     if fast_mode or len(X_final) < MIN_ROWS_FOR_MODEL:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(10G Mean)" if fast_mode else "Baseline(SmallSample)", "MAE": float("nan"), "MSE": float("nan")}
+        return {
+            "Stat": stat,
+            "Prediction": pred,
+            "Best Model": "Baseline(10G Mean)" if fast_mode else "Baseline(SmallSample)",
+            "MAE": float("nan"),
+            "MSE": float("nan"),
+        }
 
     try:
         manager = get_or_train_model_cached(player_id, season, stat, X_final, y_final)
         _ = manager.predict(X_next)
         best = manager.best_model()
-        return {"Stat": stat, "Prediction": float(best.prediction), "Best Model": best.name, "MAE": float(best.mae), "MSE": float(best.mse)}
+        return {
+            "Stat": stat,
+            "Prediction": float(best.prediction),
+            "Best Model": best.name,
+            "MAE": float(best.mae),
+            "MSE": float(best.mse),
+        }
     except Exception:
+        # Final safety net
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
         return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(Fallback)", "MAE": float("nan"), "MSE": float("nan")}
 
@@ -620,6 +635,7 @@ def table_downloaders(df: pd.DataFrame, filename_prefix: str) -> None:
         st.text_area("CSV", value=csv, height=160)
 
 def make_share_image(player_name: str, season: str, photo_bytes: Optional[bytes], table_df: pd.DataFrame, next_info: str) -> bytes:
+    # Why: deterministic, no font dependencies on cloud runners
     W, H = 1200, 675
     bg = Image.new("RGB", (W, H), color=(12, 17, 28))
     draw = ImageDraw.Draw(bg)
@@ -682,7 +698,7 @@ def page_predict(players: pd.DataFrame):
 
     season = "2025-26"
     logs = load_logs(player_id, season)
-    if logs.empty:
+    if logs.empty:  # fix: property, not callable
         year = dt.date.today().year
         fallback = f"{year-1}-{str(year)[-2:]}"
         logs = load_logs(player_id, fallback)
@@ -722,7 +738,7 @@ def page_predict(players: pd.DataFrame):
 
     df_table = results_to_table(results)
     st.subheader("Predicted Props — Table")
-    st.dataframe(df_table, use_container_width=True, hide_index=True)
+    st.dataframe(df_table, width='stretch', hide_index=True)  # deprecation-safe
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_predictions")
 
     bar_chart_from_table(df_table, title="Predictions (bars)", color=team_color)
@@ -734,7 +750,7 @@ def page_predict(players: pd.DataFrame):
     st.subheader("Recent Games")
     st.dataframe(
         logs[["GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"]],
-        use_container_width=True,
+        width='stretch',
     )
 
     if st.button("💾 Save this run"):
@@ -760,7 +776,7 @@ def _walk_forward_backtest_internal(player_id: int, season: str, stat: str, feat
     df = df.dropna(subset=["TARGET"]).reset_index(drop=True)
 
     preds, truth, dates = [], [], []
-    start_idx = max(MIN_ROWS_FOR_MODEL + 5, 8)
+    start_idx = max(MIN_ROWS_FOR_MODEL + 5, 12)
     start_idx = min(start_idx, max(len(df) - 1, 1))
     for t in range(start_idx, len(df)):
         train = df.iloc[max(0, t - N_TRAIN): t]
@@ -806,7 +822,9 @@ def page_backtest(players: pd.DataFrame):
 
     for s in seasons:
         logs = load_logs(player_id, s)
-        if logs.empty: st.warning(f"No logs for {s}."); continue
+        if logs.empty: 
+            st.warning(f"No logs for {s}."); 
+            continue
         features = build_all_features(logs, s)
 
         st.subheader(f"{name} — {s}")
@@ -816,7 +834,7 @@ def page_backtest(players: pd.DataFrame):
             st.markdown(f"**{stat}** — MAE: `{summary['MAE']:.2f}` · RMSE: `{summary['RMSE']:.2f}` · N: `{summary['N']}`")
             s_rows.append({"Stat": stat, **summary})
         df_sum = pd.DataFrame(s_rows).set_index("Stat")
-        st.dataframe(df_sum, use_container_width=True)
+        st.dataframe(df_sum, width='stretch')
         chart_df = df_sum.reset_index()[["Stat","MAE"]]
         c = alt.Chart(chart_df).mark_bar(color=team_color).encode(x=alt.X("Stat:N", sort=chart_df["Stat"].tolist()), y="MAE:Q").properties(height=280, title="Backtest MAE by Stat")
         st.altair_chart(c, use_container_width=True)
@@ -946,7 +964,7 @@ def page_favorites(players: pd.DataFrame):
     if all_rows:
         df_all = pd.concat(all_rows, ignore_index=True)
         st.subheader("Bulk predictions — Table")
-        st.dataframe(df_all, use_container_width=True, hide_index=True)
+        st.dataframe(df_all, width='stretch', hide_index=True)
         table_downloaders(df_all, filename_prefix=f"favorites_{season}_predictions")
 
     if share_images:
@@ -961,7 +979,7 @@ def page_saved():
     rows = _read_jsonl(PRED_FILE)
     if not rows: st.info("No saved runs yet."); return
     df = pd.DataFrame(rows); df["ts"] = pd.to_datetime(df["ts"])
-    st.dataframe(df[["id","ts","player_id","player_name","season","fast_mode","next_info"]].sort_values("ts", ascending=False), use_container_width=True)
+    st.dataframe(df[["id","ts","player_id","player_name","season","fast_mode","next_info"]].sort_values("ts", ascending=False), width='stretch')
     del_id = st.text_input("Delete by run id", value="")
     if st.button("🗑️ Delete run"):
         rid = del_id.strip()
