@@ -3,7 +3,8 @@
 NBA Prop Predictor — Elite (User-facing)
 - Projections only (no ML details in UI)
 - Predict, Favorites, Research (any player, full-history insights)
-- Auto opponent; DEF_Z, PACE_Z, DEF×PACE features (hidden from UI)
+- Auto opponent; Defense & Pace features (hidden under the hood)
+- Team logo & name, next opponent with EST date/time
 - Animated basketball loader; team-colored projection cards
 - Stable box-score order across cards/tables/charts
 """
@@ -16,6 +17,7 @@ import json
 import zipfile
 import hashlib
 import datetime as dt
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -569,6 +571,7 @@ def load_team_defense_pace(season: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
+    """Return next game info with UTC & EST times."""
     if not team_id or int(team_id) <= 0: return None
     year = season_start_year(season)
     today = dt.date.today().isoformat()
@@ -581,13 +584,27 @@ def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
         )
         j = r.json(); data = j.get("data", [])
         if not data: return None
-        def _d(x): return dt.datetime.fromisoformat(x["date"].replace("Z","+00:00"))
-        nxt = sorted(data, key=_d)[0]
+
+        def _dt(game):  # parse as aware UTC
+            ds = game["date"]
+            return dt.datetime.fromisoformat(ds.replace("Z", "+00:00"))
+
+        nxt = sorted(data, key=_dt)[0]
         h, v = nxt["home_team"], nxt["visitor_team"]
         is_home = (h["id"] == team_id)
         opp = v if is_home else h
-        when = _d(nxt["date"]).date()
-        return {"opp_id": opp["id"], "opp_abbr": opp["abbreviation"], "date": when, "is_home": is_home}
+
+        dt_utc = _dt(nxt)
+        dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
+
+        return {
+            "opp_id": opp["id"],
+            "opp_abbr": opp["abbreviation"],
+            "is_home": is_home,
+            "dt_utc": dt_utc,
+            "dt_est": dt_est,
+            "date": dt_est.date(),  # for backward use
+        }
     except Exception:
         return None
 
@@ -683,7 +700,7 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 
 def _apply_model_budget(manager: ModelManager, budget: str) -> None:
     # Hidden: we default to "Single" (ElasticNet) for speed
-    if budget == "Full ensemble": 
+    if budget == "Full ensemble":
         return
     if budget == "Lite (3 models)":
         wanted = {"elasticnet","hgb","stack"}
@@ -850,6 +867,15 @@ def pick_player_row(players: pd.DataFrame, selected_name: str) -> Optional[pd.Se
 # PAGES — PREDICT
 # =============================================================================
 
+def _format_next_info(next_game: Optional[Dict], rest_days: Optional[int]) -> str:
+    if not next_game:
+        return "Next: N/A"
+    side = "Home" if next_game["is_home"] else "Away"
+    dt_est = next_game.get("dt_est")
+    when_str = dt_est.strftime("%a, %b %d at %I:%M %p ET") if isinstance(dt_est, dt.datetime) else str(next_game.get("date"))
+    rd = f" · Rest {rest_days}d" if rest_days is not None else ""
+    return f"Next: {side} vs {next_game['opp_abbr']} — {when_str}{rd}"
+
 def page_predict(players: pd.DataFrame):
     st.header("NBA Prop Predictor — Elite")
     st.caption("Just the projections you need.")
@@ -869,7 +895,10 @@ def page_predict(players: pd.DataFrame):
         player_id = safe_int(row.get("id"), 0)
         team_id = safe_int(row.get("team_id"), 0)
         team_abbr = safe_str(row.get("team_abbr"), "")
-        team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
+        team_meta = TEAM_META.get(team_abbr, {})
+        team_name = team_meta.get("name", team_abbr or "")
+        team_color = team_meta.get("color", "#60a5fa")
+        team_logo = nba_logo_url(team_abbr)
         # Hidden ML settings
         fast_mode = False
         model_budget = "Single (Lasso)"   # internally mapped to ElasticNet
@@ -878,6 +907,12 @@ def page_predict(players: pd.DataFrame):
         nba_pid = None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"), None)
         photo = get_player_photo_bytes(player_id, nba_pid)
         st.image(_safe_image_from_bytes(photo, (240, 240)), caption=name)
+        if team_logo or team_name:
+            cols = st.columns([1,4])
+            with cols[0]:
+                if team_logo: st.image(team_logo, width=64)
+            with cols[1]:
+                st.markdown(f"**Team:** {team_name} ({team_abbr})")
 
     if not run:
         st.info("Choose a player and click **Get Projections**")
@@ -901,7 +936,7 @@ def page_predict(players: pd.DataFrame):
     load_ph.empty()
 
     upcoming_ctx = {}
-    next_info = "Next: N/A"
+    rest_days = None
     if next_game:
         dp = load_team_defense_pace(season)
         opp_row = dp[dp["abbreviation"] == next_game["opp_abbr"]] if not dp.empty else pd.DataFrame()
@@ -913,13 +948,16 @@ def page_predict(players: pd.DataFrame):
             upcoming_ctx["OPP_DEF_X_PACE"] = upcoming_ctx["OPP_DEF_Z"] * upcoming_ctx["OPP_PACE_Z"]
         if "GAME_DATE" in features.columns and features["GAME_DATE"].notna().any():
             last_date = pd.to_datetime(features["GAME_DATE"]).max().date()
-            rest_days = max(0, (next_game["date"] - last_date).days)
+            next_date = next_game["dt_est"].date() if isinstance(next_game.get("dt_est"), dt.datetime) else next_game.get("date")
+            rest_days = max(0, (next_date - last_date).days) if isinstance(next_date, dt.date) else None
         else:
-            rest_days = 2
+            rest_days = None
         upcoming_ctx["IS_HOME"] = 1 if next_game["is_home"] else 0
-        upcoming_ctx["REST_DAYS"] = rest_days
-        upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
-        next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']} · Rest {rest_days}d"
+        if rest_days is not None:
+            upcoming_ctx["REST_DAYS"] = rest_days
+            upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
+
+    next_info = _format_next_info(next_game, rest_days)
     st.markdown(f'<span class="badge">{next_info}</span>', unsafe_allow_html=True)
 
     load2 = st.empty()
@@ -935,11 +973,11 @@ def page_predict(players: pd.DataFrame):
     results = order_results(results)
 
     st.subheader("Projected Props")
-    render_metric_cards(results, TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
+    render_metric_cards(results, team_color)
 
     df_table = results_to_table(results)
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_projections")
-    bar_chart_from_table(df_table, title="Projections (bars)", color=TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
+    bar_chart_from_table(df_table, title="Projections (bars)", color=team_color)
 
     img_bytes = make_share_image(name, season, photo, df_table[["Stat","Pred"]], next_info)
     st.download_button("📸 Share image (PNG)", data=img_bytes, file_name=f"{name.replace(' ','_')}_{season}_projections.png", mime="image/png")
@@ -1040,7 +1078,6 @@ def page_favorites(players: pd.DataFrame):
         next_game = auto_next_opponent(team_id, season) if team_id > 0 else None
 
         upcoming_ctx = {}
-        next_info = "Next: N/A"
         if next_game:
             opp_row = dp[dp["abbreviation"] == next_game["opp_abbr"]] if not dp.empty else pd.DataFrame()
             if not opp_row.empty:
@@ -1051,13 +1088,14 @@ def page_favorites(players: pd.DataFrame):
                 upcoming_ctx["OPP_DEF_X_PACE"] = upcoming_ctx["OPP_DEF_Z"] * upcoming_ctx["OPP_PACE_Z"]
             if "GAME_DATE" in feats.columns and feats["GAME_DATE"].notna().any():
                 last_date = pd.to_datetime(feats["GAME_DATE"]).max().date()
-                rest_days = max(0, (next_game["date"] - last_date).days)
+                next_date = next_game["dt_est"].date() if isinstance(next_game.get("dt_est"), dt.datetime) else next_game.get("date")
+                rest_days = max(0, (next_date - last_date).days) if isinstance(next_date, dt.date) else None
             else:
-                rest_days = 2
+                rest_days = None
             upcoming_ctx["IS_HOME"] = 1 if next_game["is_home"] else 0
-            upcoming_ctx["REST_DAYS"] = rest_days
-            upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
-            next_info = f"Next: {('Home' if next_game['is_home'] else 'Away')} vs {next_game['opp_abbr']} on {next_game['date']} · Rest {rest_days}d"
+            if rest_days is not None:
+                upcoming_ctx["REST_DAYS"] = rest_days
+                upcoming_ctx["BACK_TO_BACK"] = 1 if rest_days == 1 else 0
 
         futures, res = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -1079,6 +1117,7 @@ def page_favorites(players: pd.DataFrame):
         st.altair_chart(c, use_container_width=True)
 
         photo = get_player_photo_bytes(pid, nba_pid)
+        next_info = _format_next_info(next_game, rest_days if next_game else None)
         share_bytes = make_share_image(pname, season, photo, df_table[["Stat","Pred"]], next_info)
         share_images.append((f"{pname.replace(' ','_')}_{season}.png", share_bytes))
 
@@ -1139,36 +1178,68 @@ def _window_avg(df: pd.DataFrame, n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 def _season_from_date(date_val: dt.date) -> str:
     y = date_val.year
-    # NBA seasons start in Oct; consider Aug-Sep as preseason bridge.
     start = dt.date(y, 10, 1)
     if date_val >= start:
         return f"{y}-{str(y+1)[-2:]}"
     return f"{y-1}-{str(y)[-2:]}"
 
 def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
-    if df_w.empty: 
+    """Render trends & averages charts for a window; robust to missing stats."""
+    if df_w is None or df_w.empty or "GAME_DATE" not in df_w.columns:
         return
-    # Line trends for PTS/REB/AST over the window
-    show_cols = ["PTS","REB","AST"]
-    long = df_w[["GAME_DATE"] + [c for c in show_cols if c in df_w.columns]].melt(id_vars=["GAME_DATE"], var_name="Stat", value_name="Val")
-    c_line = alt.Chart(long).mark_line(color=None).encode(
-        x="GAME_DATE:T", y="Val:Q", color=alt.Color("Stat:N"),
-        tooltip=["GAME_DATE:T","Stat:N","Val:Q"]
-    ).properties(height=220, title=f"{title_prefix} — Trends (PTS/REB/AST)")
+
+    value_cols = [c for c in ["PTS", "REB", "AST"] if c in df_w.columns]
+    if not value_cols:
+        st.info("No chartable stats available for this window.")
+        return
+
+    df_w = df_w.copy()
+    df_w["GAME_DATE"] = pd.to_datetime(df_w["GAME_DATE"], errors="coerce")
+    df_w = df_w.dropna(subset=["GAME_DATE"])
+    if df_w.empty:
+        st.info("No valid dates to chart.")
+        return
+
+    base = df_w[["GAME_DATE"] + value_cols]
+    if base[value_cols].notna().sum().sum() == 0:
+        st.info("No numeric values to chart in this window.")
+        return
+
+    long = base.melt(id_vars=["GAME_DATE"], var_name="Stat", value_name="Val").dropna(subset=["Val"])
+    if long.empty:
+        st.info("No chartable data after cleaning.")
+        return
+
+    c_line = (
+        alt.Chart(long)
+        .mark_line()   # fixed: removed color=None
+        .encode(
+            x="GAME_DATE:T",
+            y="Val:Q",
+            color=alt.Color("Stat:N"),
+            tooltip=["GAME_DATE:T", "Stat:N", "Val:Q"],
+        )
+        .properties(height=220, title=f"{title_prefix} — Trends (PTS/REB/AST)")
+    )
     st.altair_chart(c_line, use_container_width=True)
 
-    # Bar of averages across stats for the window
     avg_long = long.groupby("Stat", as_index=False)["Val"].mean()
-    c_bar = alt.Chart(avg_long).mark_bar().encode(
-        x=alt.X("Stat:N", sort=["PTS","REB","AST"]),
-        y="Val:Q",
-        tooltip=["Stat","Val"]
-    ).properties(height=220, title=f"{title_prefix} — Averages")
-    st.altair_chart(c_bar, use_container_width=True)
+    if not avg_long.empty:
+        c_bar = (
+            alt.Chart(avg_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("Stat:N", sort=["PTS", "REB", "AST"]),
+                y="Val:Q",
+                tooltip=["Stat", "Val"],
+            )
+            .properties(height=220, title=f"{title_prefix} — Averages")
+        )
+        st.altair_chart(c_bar, use_container_width=True)
 
 def page_research():
     st.header("Research")
-    st.caption("Type a player, see last game at a glance, then dive into rolling windows and season/career views.")
+    st.caption("Most recent performance at a glance, plus rolling windows and season/career breakdowns.")
 
     all_players = load_player_list_all()
     if all_players.empty:
@@ -1191,26 +1262,48 @@ def page_research():
     pid = safe_int(row.get("id"), 0)
     nba_pid = None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"), None)
     abbr = safe_str(row.get("team_abbr"), "")
-    color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
+    team_meta = TEAM_META.get(abbr, {})
+    color = team_meta.get("color", "#60a5fa")
+    team_name = team_meta.get("name", abbr or "")
+    team_logo = nba_logo_url(abbr)
 
     colA, colB = st.columns([1,3])
     with colA:
         photo = get_player_photo_bytes(pid, nba_pid)
         st.image(_safe_image_from_bytes(photo, (220, 220)), caption=name)
     with colB:
+        if team_logo or team_name:
+            cols = st.columns([1,5])
+            with cols[0]:
+                if team_logo: st.image(team_logo, width=64)
+            with cols[1]:
+                st.markdown(f"**Team:** {team_name} ({abbr})")
         run = st.button("Load player data")
 
     if not run:
         st.info("Click **Load player data** to view last game & rolling windows.")
         return
 
-    # Load all seasons (cached by season; safe but may take a moment the first time)
+    # Load all seasons
     ph = st.empty(); show_basketball_loader(ph, "Loading game logs across seasons…")
     seasons_all = _season_strings(2000, dt.date.today().year)
     logs = fetch_logs_multi(pid, seasons_all)
     ph.empty()
     if logs.empty:
         st.warning("No logs found."); return
+
+    # Show upcoming opponent info (EST) if we can infer a current team_id
+    # We don't always have a reliable team_id for past players; use team from player row if present
+    team_id = safe_int(row.get("team_id"), 0)
+    next_game = auto_next_opponent(team_id, seasons_all[-1]) if team_id > 0 else None
+    rest_days = None
+    if next_game and logs["GAME_DATE"].notna().any():
+        last_date = pd.to_datetime(logs["GAME_DATE"]).max().date()
+        next_date = next_game["dt_est"].date() if isinstance(next_game.get("dt_est"), dt.datetime) else next_game.get("date")
+        if isinstance(next_date, dt.date):
+            rest_days = max(0, (next_date - last_date).days)
+    badge = _format_next_info(next_game, rest_days)
+    st.markdown(f'<span class="badge">{badge}</span>', unsafe_allow_html=True)
 
     # Most Recent Performance (not an expander)
     st.subheader("Most Recent Performance (Last Game Played)")
@@ -1237,7 +1330,6 @@ def page_research():
     _section("Last 20 Games", 20)
 
     # Current & Past Season
-    # Derive current season from the last game date
     if lg["GAME_DATE"].notna().any():
         last_date = pd.to_datetime(lg["GAME_DATE"]).max().date()
         cur_season = _season_from_date(last_date)
