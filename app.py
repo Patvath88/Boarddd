@@ -1,12 +1,11 @@
 # app.py
 """
-NBA Prop Predictor — Elite (IndexError-safe)
-- Guards empty players/selectbox resolution (no .iloc[0] crashes)
-- Safe player picking via pick_player_row()
-- Auto opponent only if team_id is valid
-- REST_DAYS robust even if GAME_DATE missing
-- All prior features preserved (DEF/PACE, DEF×PACE, photos/logos, glow favorites with ❌,
-  backtests, CSV, share images, bar charts)
+NBA Prop Predictor — Elite (Predict & Favorites only)
+- Active-player loader with robust fallbacks + Refresh cache
+- Auto next opponent; defense & pace features (DEF_Z, PACE_Z, DEF×PACE)
+- Photos, logos, glow favorites with ❌
+- Copyable/downloadable table, shareable images, per-stat bar charts
+- Model budget control (Full / Lite 3 models / Single)
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ import altair as alt
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 
-# Your modules (must exist)
+# Local modules expected in your repo
 import data_fetching as dfetch
 from models import ModelManager
 
@@ -68,7 +67,6 @@ MAX_WORKERS = max(2, min(8, os.cpu_count() or 4))
 
 DATA_DIR = Path("./data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-PRED_FILE = DATA_DIR / "predictions.jsonl"
 FAV_FILE = DATA_DIR / "favorites.json"
 
 
@@ -206,19 +204,8 @@ def prev_season(season: str) -> str:
 
 
 # =============================================================================
-# PERSISTENCE
+# PERSISTENCE (favorites)
 # =============================================================================
-
-def _read_jsonl(path: Path) -> List[dict]:
-    if not path.exists(): return []
-    with path.open("r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-def _write_jsonl(path: Path, rows: List[dict]) -> None:
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        for r in rows: f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    tmp.replace(path)
 
 def _load_favorites() -> List[dict]:
     if not FAV_FILE.exists(): return []
@@ -298,7 +285,6 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id"])
     p = df.copy()
 
-    # id normalization
     id_done = False
     for c in ["id","player_id","PLAYER_ID","PersonId","PERSON_ID"]:
         if c in p.columns:
@@ -307,7 +293,6 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
     if not id_done:
         p["id"] = pd.NA
 
-    # full_name normalization
     if "full_name" not in p.columns:
         if {"first_name","last_name"}.issubset(p.columns):
             p["full_name"] = (p["first_name"].astype(str).str.strip() + " " + p["last_name"].astype(str).str.strip()).str.strip()
@@ -318,7 +303,6 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
         else:
             p["full_name"] = p.get("full_name","Unknown")
 
-    # team cols
     p = _safe_get_team_cols(p)
     if "team_abbr" not in p.columns or p["team_abbr"].isna().all():
         teams = load_teams_bdl()
@@ -328,7 +312,6 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
                 on="team_id", how="left"
             )
 
-    # nba_person_id normalization
     nba_done = False
     for c in ["nba_person_id","PERSON_ID","personId","nba_id"]:
         if c in p.columns:
@@ -342,19 +325,64 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
 
     cols = ["id","full_name","team_id","team_abbr","nba_person_id"]
     out = p[cols].dropna(subset=["id"]).drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
+    # drop blank names
+    out = out[out["full_name"].astype(str).str.strip().ne("")]
     return out
 
 @st.cache_data(show_spinner=False)
+def bdl_fetch_active_players_direct() -> pd.DataFrame:
+    out = []
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
+    url = "https://www.balldontlie.io/api/v1/players"
+    page = 1
+    while True:
+        try:
+            r = s.get(url, params={"active": "true", "per_page": 100, "page": page}, timeout=8)
+            r.raise_for_status()
+            j = r.json()
+            data = j.get("data", [])
+            if not data: break
+            out.extend(data)
+            meta = j.get("meta", {})
+            if not meta or not meta.get("next_page"): break
+            page = meta["next_page"]
+        except Exception:
+            break
+    return pd.DataFrame(out)
+
+@st.cache_data(show_spinner=False)
 def load_player_list(season: str = "2025-26") -> pd.DataFrame:
+    # 1) dfetch primary
     try:
         raw = dfetch.get_active_players_balldontlie()
         p = normalize_players_df(raw)
-        return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
+        if not p.empty:
+            return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
     except Exception:
+        pass
+    # 2) direct balldontlie fallback
+    try:
+        raw2 = bdl_fetch_active_players_direct()
+        p2 = normalize_players_df(raw2)
+        if not p2.empty:
+            return p2[["id","full_name","team_id","team_abbr","nba_person_id"]]
+    except Exception:
+        pass
+    # 3) nba.com fallback through dfetch
+    try:
         fb = dfetch.get_player_list_nba()
-        p = normalize_players_df(_filter_active_players(fb, season))
-        return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
-
+        p3 = normalize_players_df(_filter_active_players(fb, season))
+        if not p3.empty:
+            return p3[["id","full_name","team_id","team_abbr","nba_person_id"]]
+    except Exception:
+        pass
+    # 4) favorites fallback to avoid empty UI
+    favs = _load_favorites()
+    if favs:
+        p4 = pd.DataFrame(favs)[["id","full_name","team_id","team_abbr","nba_person_id"]]
+        return p4.drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
+    return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id"])
 
 def _filter_active_players(df: pd.DataFrame, season_str: str) -> pd.DataFrame:
     if df.empty: return df
@@ -384,14 +412,13 @@ def _filter_active_players(df: pd.DataFrame, season_str: str) -> pd.DataFrame:
     if not active.any() and team_cols: active = df[team_cols[0]].notna() & (df[team_cols[0]] != 0)
     return df[active].copy()
 
-
 @st.cache_data(show_spinner=False)
 def load_logs(player_id: int, season: str) -> pd.DataFrame:
     return dfetch.get_player_game_logs_nba(player_id, season).copy()
 
 
 # =============================================================================
-# AUTO NEXT OPPONENT + LEAGUE DEFENSE & PACE
+# OPPONENT DEFENSE & PACE (Balldontlie)
 # =============================================================================
 
 def _bdl_paginate(url: str, params: Dict) -> List[Dict]:
@@ -435,8 +462,7 @@ def load_team_defense_pace(season: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
-    if not team_id or int(team_id) <= 0:
-        return None
+    if not team_id or int(team_id) <= 0: return None
     year = season_start_year(season)
     today = dt.date.today().isoformat()
     s = requests.Session(); s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
@@ -488,7 +514,7 @@ def attach_defense_pace(df: pd.DataFrame, defense_pace: pd.DataFrame) -> pd.Data
     m = defense_pace.rename(columns={"abbreviation":"OPP_TEAM"})
     df = df.merge(m[["OPP_TEAM","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z"]], on="OPP_TEAM", how="left")
     df = df.rename(columns={"PACE":"OPP_PACE","PACE_Z":"OPP_PACE_Z"})
-    df["OPP_DEF_X_PACE"] = df["OPP_DEF_Z"] * df["OPP_PACE_Z"]
+    df["OPP_DEF_X_PACE"] = df["OPP_DEF_Z"] * df["OPP_PACE_Z"]  # pace-adjusted projection piece
     return df
 
 def _ensure_training_base(df: pd.DataFrame, season: str) -> pd.DataFrame:
@@ -509,7 +535,7 @@ def build_all_features(df_in: pd.DataFrame, season: str) -> pd.DataFrame:
         out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
     for c in STAT_COLUMNS:
         s = out[c].to_numpy(dtype=float, copy=False)
-        out[f"{c}_L1"]  = np.roll(s, 1); 
+        out[f"{c}_L1"]  = np.roll(s, 1)
         if len(out.index) > 0:
             out.loc[out.index[0], f"{c}_L1"] = np.nan
         out[f"{c}_L3"]  = out[c].shift(3)
@@ -545,14 +571,40 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
-# MODEL CACHE + TRAIN/PREDICT
+# MODEL TRAINING / PREDICTION
 # =============================================================================
 
-def get_or_train_model_cached(player_id: int, season: str, stat: str, X: pd.DataFrame, y: np.ndarray) -> ModelManager:
-    key = _hash_frame_small(X, y, player_id, season, stat)
+def _apply_model_budget(manager: ModelManager, budget: str) -> None:
+    """Hint the ModelManager to use fewer models if it supports whitelisting."""
+    if budget == "Full ensemble": 
+        return
+    if budget == "Lite (3 models)":
+        wanted = {"lasso","ridge","random_forest","rf"}
+    else:  # "Single (Lasso)"
+        wanted = {"lasso"}
+    try:
+        if hasattr(manager, "set_model_whitelist"):
+            manager.set_model_whitelist(list(wanted))
+            return
+        # best-effort fallbacks (duck-typing)
+        if hasattr(manager, "available_models") and isinstance(manager.available_models, list):
+            manager.available_models = [m for m in manager.available_models
+                                        if str(getattr(m, "name", m)).lower() in wanted or
+                                           str(getattr(m, "key", m)).lower() in wanted]
+        elif hasattr(manager, "models") and isinstance(manager.models, list):
+            manager.models = [m for m in manager.models
+                              if str(getattr(m, "name", m)).lower() in wanted or
+                                 str(getattr(m, "key", m)).lower() in wanted]
+    except Exception:
+        # ignore if manager doesn't support
+        pass
+
+def get_or_train_model_cached(player_id: int, season: str, stat: str, X: pd.DataFrame, y: np.ndarray, budget: str) -> ModelManager:
+    key = _hash_frame_small(X, y, player_id, season, stat) + f"|{budget}"
     ss: Dict[str, ModelManager] = st.session_state.setdefault("model_cache", {})
     if key in ss: return ss[key]
     manager = ModelManager(random_state=42)
+    _apply_model_budget(manager, budget)
     manager.train(X, y)
     ss[key] = manager
     return manager
@@ -563,6 +615,7 @@ def train_predict_for_stat(
     stat: str,
     features: pd.DataFrame,
     fast_mode: bool,
+    model_budget: str,
     upcoming_ctx: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     y_all = build_target(features, stat).to_numpy()
@@ -586,10 +639,10 @@ def train_predict_for_stat(
 
     if fast_mode or len(X_final) < MIN_ROWS_FOR_MODEL:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline(10G Mean)" if fast_mode else "Baseline(SmallSample)", "MAE": float("nan"), "MSE": float("nan")}
+        return {"Stat": stat, "Prediction": pred, "Best Model": "Baseline", "MAE": float("nan"), "MSE": float("nan")}
 
     try:
-        manager = get_or_train_model_cached(player_id, season, stat, X_final, y_final)
+        manager = get_or_train_model_cached(player_id, season, stat, X_final, y_final, model_budget)
         _ = manager.predict(X_next)
         best = manager.best_model()
         return {"Stat": stat, "Prediction": float(best.prediction), "Best Model": best.name, "MAE": float(best.mae), "MSE": float(best.mse)}
@@ -658,15 +711,11 @@ def bar_chart_from_table(df: pd.DataFrame, title: str, color: str | None = None)
 # =============================================================================
 
 def pick_player_row(players: pd.DataFrame, selected_name: str) -> Optional[pd.Series]:
-    """Resolve selected player safely (no out-of-bounds)."""
-    if players is None or players.empty:
-        return None
+    if players is None or players.empty: return None
     names = players["full_name"].astype(str).values
-    # Resolve by exact match index; fallback to first row if not found
     idx = np.where(names == str(selected_name))[0]
     if idx.size:
         return players.iloc[int(idx[0])]
-    # Fallback if somehow label not found
     return players.iloc[0]
 
 
@@ -679,7 +728,7 @@ def page_predict(players: pd.DataFrame):
     st.caption("Auto opponent • Defense + Pace • Copyable table • Share image")
 
     if players is None or players.empty:
-        st.error("No active players available. Please reload the app or try again later.")
+        st.error("No active players available. Click **Refresh players** in the sidebar and try again.")
         return
 
     names_list = players["full_name"].astype(str).tolist()
@@ -696,6 +745,7 @@ def page_predict(players: pd.DataFrame):
         team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
         nba_pid = int(row["nba_person_id"]) if "nba_person_id" in row and not pd.isna(row["nba_person_id"]) else None
         fast_mode = st.toggle("Fast mode (no training)", value=False, key="fast_toggle")
+        model_budget = st.radio("Model budget", ["Full ensemble", "Lite (3 models)", "Single (Lasso)"], index=0, help="Fewer models = faster", key="model_budget")
         run = st.button("Get Predictions Now")
     with col_right:
         photo = get_player_photo_bytes(player_id, nba_pid)
@@ -719,7 +769,6 @@ def page_predict(players: pd.DataFrame):
     with st.spinner("Building features…"):
         features = build_all_features(logs, season)
 
-    # SAFER REST DAYS + badge
     upcoming_ctx = {}
     next_info = "Next: N/A"
     if next_game:
@@ -746,7 +795,7 @@ def page_predict(players: pd.DataFrame):
         futures, results = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             for stat in PROP_MAP.keys():
-                futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode, upcoming_ctx)] = stat
+                futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode, model_budget, upcoming_ctx)] = stat
             for fut in as_completed(futures): results.append(fut.result())
 
     df_table = results_to_table(results)
@@ -764,108 +813,6 @@ def page_predict(players: pd.DataFrame):
     cols_show = [c for c in ["GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in logs.columns]
     st.dataframe(logs[cols_show], use_container_width=True)
 
-    if st.button("💾 Save this run"):
-        rows = _read_jsonl(PRED_FILE)
-        rec = {
-            "id": str(uuid.uuid4()),
-            "ts": dt.datetime.utcnow().isoformat(),
-            "player_id": player_id,
-            "player_name": name,
-            "season": season,
-            "fast_mode": fast_mode,
-            "next_info": next_info,
-            "results": df_table.to_dict(orient="records"),
-        }
-        rows.append(rec); _write_jsonl(PRED_FILE, rows)
-        st.success("Saved.")
-
-
-def _walk_forward_backtest_internal(player_id: int, season: str, stat: str, features: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    y_all = build_target(features, stat)
-    X_all = select_X_for_stat(features, stat)
-    use_cols = ["GAME_DATE"] if "GAME_DATE" in features.columns else []
-    df = pd.concat([features[use_cols], y_all.rename("TARGET"), X_all], axis=1)
-    df = df.dropna(subset=["TARGET"]).reset_index(drop=True)
-
-    preds, truth, dates = [], [], []
-    start_idx = max(MIN_ROWS_FOR_MODEL + 5, 12)
-    start_idx = min(start_idx, max(len(df) - 1, 1))
-    for t in range(start_idx, len(df)):
-        train = df.iloc[max(0, t - N_TRAIN): t]
-        test = df.iloc[[t]]
-        y_tr = train["TARGET"].to_numpy()
-        X_tr = _impute_features(train.drop(columns=[c for c in ["TARGET", "GAME_DATE"] if c in train.columns]))
-        X_te = _impute_features(test.drop(columns=[c for c in ["TARGET", "GAME_DATE"] if c in test.columns]))
-        if len(X_tr) < MIN_ROWS_FOR_MODEL:
-            yhat = float(np.nanmean(y_tr[-10:])) if np.isfinite(y_tr[-10:]).any() else float("nan")
-        else:
-            try:
-                manager = ModelManager(random_state=42)
-                manager.train(X_tr, y_tr)
-                yhat = float(manager.predict(X_te))
-            except Exception:
-                yhat = float(np.nanmean(y_tr[-10:])) if np.isfinite(y_tr[-10:]).any() else float("nan")
-        preds.append(yhat)
-        truth.append(float(test["TARGET"].iloc[0]))
-        if "GAME_DATE" in test.columns:
-            dates.append(pd.to_datetime(test["GAME_DATE"]).iloc[0])
-        else:
-            dates.append(pd.NaT)
-
-    out = pd.DataFrame({"GAME_DATE": dates, "y_true": truth, "y_pred": preds})
-    out["abs_err"] = (out["y_true"] - out["y_pred"]).abs()
-    out["sq_err"] = (out["y_true"] - out["y_pred"]) ** 2
-    mae = float(out["abs_err"].mean()) if len(out) else float("nan")
-    rmse = float(np.sqrt(out["sq_err"].mean())) if len(out) else float("nan")
-    return out, {"MAE": mae, "RMSE": rmse, "N": int(len(out))}
-
-def page_backtest(players: pd.DataFrame):
-    st.header("Backtesting")
-
-    if players is None or players.empty:
-        st.error("No active players available for backtesting.")
-        return
-
-    names_list = players["full_name"].astype(str).tolist()
-    name = st.selectbox("Player", names_list, key="bt_player")
-    prow = pick_player_row(players, name)
-    if prow is None:
-        st.error("Could not resolve the selected player.")
-        return
-
-    player_id = int(prow["id"])
-    team_abbr = str(prow.get("team_abbr") or "")
-    team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
-
-    season = "2025-26"
-    do_this = st.checkbox("This season", value=True)
-    do_last = st.checkbox("Last season", value=True)
-    run = st.button("Run Backtests")
-    if not run: return
-
-    seasons = []
-    if do_this: seasons.append(season)
-    if do_last: seasons.append(prev_season(season))
-
-    for s in seasons:
-        logs = load_logs(player_id, s)
-        if logs.empty:
-            st.warning(f"No logs for {s}."); 
-            continue
-        features = build_all_features(logs, s)
-
-        st.subheader(f"{name} — {s}")
-        s_rows = []
-        for stat in PROP_MAP.keys():
-            df_bt, summary = _walk_forward_backtest_internal(player_id, s, stat, features)
-            st.markdown(f"**{stat}** — MAE: `{summary['MAE']:.2f}` · RMSE: `{summary['RMSE']:.2f}` · N: `{summary['N']}`")
-            s_rows.append({"Stat": stat, **summary})
-        df_sum = pd.DataFrame(s_rows).set_index("Stat")
-        st.dataframe(df_sum, use_container_width=True)
-        chart_df = df_sum.reset_index()[["Stat","MAE"]]
-        c = alt.Chart(chart_df).mark_bar(color=team_color).encode(x=alt.X("Stat:N", sort=chart_df["Stat"].tolist()), y="MAE:Q").properties(height=280, title="Backtest MAE by Stat")
-        st.altair_chart(c, use_container_width=True)
-
 
 def page_favorites(players: pd.DataFrame):
     st.header("Favorites (Auto Opp • Defense & Pace • Glow Cards)")
@@ -876,7 +823,6 @@ def page_favorites(players: pd.DataFrame):
 
     favs = _load_favorites()
 
-    # Add favorite
     col1, col2 = st.columns([3,1])
     with col1:
         names_list = players["full_name"].astype(str).tolist()
@@ -897,7 +843,6 @@ def page_favorites(players: pd.DataFrame):
                 else:
                     st.info("Already in favorites.")
 
-    # List favorites as glow cards with ❌
     if favs:
         st.subheader("Saved favorites")
         cols = st.columns(3)
@@ -926,6 +871,7 @@ def page_favorites(players: pd.DataFrame):
     st.divider()
     st.subheader("Bulk Predict (auto opponent)")
     fast_mode = st.toggle("Fast mode (no training)", value=False, key="fav_fast")
+    model_budget = st.radio("Model budget (bulk)", ["Full ensemble", "Lite (3 models)", "Single (Lasso)"], index=1, horizontal=True, key="fav_budget")
     run_all = st.button("Run predictions for all favorites")
 
     if not run_all or not favs: return
@@ -977,13 +923,12 @@ def page_favorites(players: pd.DataFrame):
         futures, res = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             for stat in PROP_MAP.keys():
-                futures[ex.submit(train_predict_for_stat, pid, season, stat, feats, fast_mode, upcoming_ctx)] = stat
+                futures[ex.submit(train_predict_for_stat, pid, season, stat, feats, fast_mode, model_budget, upcoming_ctx)] = stat
             for fut in as_completed(futures): res.append(fut.result())
         df_table = results_to_table(res)
         df_table.insert(0, "Player", pname); df_table.insert(1, "Season", season)
         all_rows.append(df_table)
 
-        # per-player bar chart
         team_color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
         c = alt.Chart(df_table.rename(columns={"Pred":"Prediction"})).mark_bar(color=team_color).encode(
             x=alt.X("Stat:N", sort=df_table["Stat"].tolist()),
@@ -992,10 +937,9 @@ def page_favorites(players: pd.DataFrame):
         ).properties(width="container", height=220, title=f"{pname} — Predictions")
         st.altair_chart(c, use_container_width=True)
 
-        # share-card per player
         photo = get_player_photo_bytes(pid, nba_pid)
-        img_bytes = make_share_image(pname, season, photo, df_table[["Stat","Pred","Model","MAE","MSE"]], next_info)
-        share_images.append((f"{pname.replace(' ','_')}_{season}.png", img_bytes))
+        share_bytes = make_share_image(pname, season, photo, df_table[["Stat","Pred","Model","MAE","MSE"]], next_info)
+        share_images.append((f"{pname.replace(' ','_')}_{season}.png", share_bytes))
 
         progress.progress((i+1)/len(favs))
 
@@ -1004,27 +948,14 @@ def page_favorites(players: pd.DataFrame):
         df_all = pd.concat(all_rows, ignore_index=True)
         st.subheader("Bulk predictions — Table")
         st.dataframe(df_all, use_container_width=True, hide_index=True)
-        table_downloaders(df_all, filename_prefix=f"favorites_{season}_predictions")
+        csv = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download all (CSV)", data=csv, file_name=f"favorites_{season}_predictions.csv", mime="text/csv")
 
     if share_images:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for fname, content in share_images: z.writestr(fname, content)
         st.download_button("📦 Download share images (ZIP)", data=buf.getvalue(), file_name=f"favorites_{season}_share_images.zip", mime="application/zip")
-
-
-def page_saved():
-    st.header("Saved Predictions")
-    rows = _read_jsonl(PRED_FILE)
-    if not rows: st.info("No saved runs yet."); return
-    df = pd.DataFrame(rows); df["ts"] = pd.to_datetime(df["ts"])
-    st.dataframe(df[["id","ts","player_id","player_name","season","fast_mode","next_info"]].sort_values("ts", ascending=False), use_container_width=True)
-    del_id = st.text_input("Delete by run id", value="")
-    if st.button("🗑️ Delete run"):
-        rid = del_id.strip()
-        new_rows = [r for r in rows if r["id"] != rid]
-        if len(new_rows) == len(rows): st.warning("Run id not found.")
-        else: _write_jsonl(PRED_FILE, new_rows); st.success("Deleted.")
 
 
 # =============================================================================
@@ -1034,22 +965,22 @@ def page_saved():
 def main():
     st.set_page_config(page_title="NBA Prop Predictor — Elite", page_icon="🏀", layout="wide")
     inject_css()
-    players = load_player_list("2025-26")
 
     with st.sidebar:
         st.markdown("## Navigation")
-        page = st.radio("Go to", ["Predict", "Backtest", "Favorites", "Saved"], label_visibility="collapsed")
+        page = st.radio("Go to", ["Predict", "Favorites"], label_visibility="collapsed")
         st.markdown("---")
+        if st.button("🔄 Refresh players"):
+            load_player_list.clear()
+            _rerun()
         st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">CSV</span> <span class="tag">Share</span>', unsafe_allow_html=True)
+
+    players = load_player_list("2025-26")
 
     if page == "Predict":
         page_predict(players)
-    elif page == "Backtest":
-        page_backtest(players)
-    elif page == "Favorites":
-        page_favorites(players)
     else:
-        page_saved()
+        page_favorites(players)
 
 
 if __name__ == "__main__":
