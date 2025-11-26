@@ -1,10 +1,11 @@
 # app.py
 """
 NBA Prop Predictor — Elite (Predict & Favorites only)
-- Active-player loader with robust fallbacks + Refresh cache
-- Auto next opponent; defense & pace features (DEF_Z, PACE_Z, DEF×PACE)
-- Photos, logos, glow favorites with ❌
-- Copyable/downloadable table, shareable images, per-stat bar charts
+- Fix: pd.NA truthiness crash via safe_int/safe_str helpers (no more NAType.__bool__)
+- Robust active-player loader + Refresh cache
+- Auto next opponent; DEF_Z, PACE_Z, DEF×PACE
+- Photos/logos, copyable table + CSV, shareable PNG, per-stat bar charts
+- Favorites with glow cards and ❌ removal
 - Model budget control (Full / Lite 3 models / Single)
 """
 
@@ -172,6 +173,26 @@ def _rerun():
     except Exception:
         st.experimental_rerun()
 
+def safe_int(v, default=0) -> int:
+    """Convert to int; treat None/NaN/pd.NA/'' as default. Avoids NAType.__bool__."""
+    try:
+        if v is None: return default
+        if isinstance(v, str) and v.strip() == "": return default
+        if pd.isna(v): return default
+        return int(v)
+    except Exception:
+        return default
+
+def safe_str(v, default="") -> str:
+    """Convert to str; treat None/NaN/pd.NA as default. Avoids NA truthiness."""
+    try:
+        if v is None: return default
+        if pd.isna(v): return default
+        s = str(v)
+        return s if s.strip() != "" else default
+    except Exception:
+        return default
+
 def _rolling_slope(values: np.ndarray, window: int) -> np.ndarray:
     x = np.asarray(values, dtype=float); n = window
     if x.size == 0 or n <= 1: return np.full_like(x, np.nan, dtype=float)
@@ -325,7 +346,6 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
 
     cols = ["id","full_name","team_id","team_abbr","nba_person_id"]
     out = p[cols].dropna(subset=["id"]).drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
-    # drop blank names
     out = out[out["full_name"].astype(str).str.strip().ne("")]
     return out
 
@@ -380,8 +400,13 @@ def load_player_list(season: str = "2025-26") -> pd.DataFrame:
     # 4) favorites fallback to avoid empty UI
     favs = _load_favorites()
     if favs:
-        p4 = pd.DataFrame(favs)[["id","full_name","team_id","team_abbr","nba_person_id"]]
-        return p4.drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
+        p4 = pd.DataFrame(favs)
+        for col in ["team_id","team_abbr","nba_person_id"]:
+            if col not in p4.columns: p4[col] = None
+        p4["team_id"] = p4["team_id"].apply(lambda x: safe_int(x, 0))
+        p4["team_abbr"] = p4["team_abbr"].apply(lambda x: safe_str(x, ""))
+        p4["nba_person_id"] = p4["nba_person_id"].apply(lambda x: None if x in (None, "", 0) else int(x))
+        return p4[["id","full_name","team_id","team_abbr","nba_person_id"]].drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
     return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id"])
 
 def _filter_active_players(df: pd.DataFrame, season_str: str) -> pd.DataFrame:
@@ -514,7 +539,7 @@ def attach_defense_pace(df: pd.DataFrame, defense_pace: pd.DataFrame) -> pd.Data
     m = defense_pace.rename(columns={"abbreviation":"OPP_TEAM"})
     df = df.merge(m[["OPP_TEAM","OPP_DEF_PPG","OPP_DEF_Z","PACE","PACE_Z"]], on="OPP_TEAM", how="left")
     df = df.rename(columns={"PACE":"OPP_PACE","PACE_Z":"OPP_PACE_Z"})
-    df["OPP_DEF_X_PACE"] = df["OPP_DEF_Z"] * df["OPP_PACE_Z"]  # pace-adjusted projection piece
+    df["OPP_DEF_X_PACE"] = df["OPP_DEF_Z"] * df["OPP_PACE_Z"]
     return df
 
 def _ensure_training_base(df: pd.DataFrame, season: str) -> pd.DataFrame:
@@ -575,7 +600,6 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _apply_model_budget(manager: ModelManager, budget: str) -> None:
-    """Hint the ModelManager to use fewer models if it supports whitelisting."""
     if budget == "Full ensemble": 
         return
     if budget == "Lite (3 models)":
@@ -584,9 +608,7 @@ def _apply_model_budget(manager: ModelManager, budget: str) -> None:
         wanted = {"lasso"}
     try:
         if hasattr(manager, "set_model_whitelist"):
-            manager.set_model_whitelist(list(wanted))
-            return
-        # best-effort fallbacks (duck-typing)
+            manager.set_model_whitelist(list(wanted)); return
         if hasattr(manager, "available_models") and isinstance(manager.available_models, list):
             manager.available_models = [m for m in manager.available_models
                                         if str(getattr(m, "name", m)).lower() in wanted or
@@ -596,7 +618,6 @@ def _apply_model_budget(manager: ModelManager, budget: str) -> None:
                               if str(getattr(m, "name", m)).lower() in wanted or
                                  str(getattr(m, "key", m)).lower() in wanted]
     except Exception:
-        # ignore if manager doesn't support
         pass
 
 def get_or_train_model_cached(player_id: int, season: str, stat: str, X: pd.DataFrame, y: np.ndarray, budget: str) -> ModelManager:
@@ -739,11 +760,13 @@ def page_predict(players: pd.DataFrame):
         if row is None:
             st.error("Could not resolve the selected player."); 
             return
-        player_id = int(row["id"])
-        team_id = int(row.get("team_id", 0) or 0)
-        team_abbr = str(row.get("team_abbr") or "")
+        player_id = safe_int(row.get("id"), 0)
+        team_id = safe_int(row.get("team_id"), 0)
+        team_abbr = safe_str(row.get("team_abbr"), "")
         team_color = TEAM_META.get(team_abbr, {}).get("color", "#60a5fa")
-        nba_pid = int(row["nba_person_id"]) if "nba_person_id" in row and not pd.isna(row["nba_person_id"]) else None
+        nba_pid = None
+        if "nba_person_id" in row and not pd.isna(row["nba_person_id"]):
+            nba_pid = safe_int(row["nba_person_id"], None)
         fast_mode = st.toggle("Fast mode (no training)", value=False, key="fast_toggle")
         model_budget = st.radio("Model budget", ["Full ensemble", "Lite (3 models)", "Single (Lasso)"], index=0, help="Fewer models = faster", key="model_budget")
         run = st.button("Get Predictions Now")
@@ -833,10 +856,12 @@ def page_favorites(players: pd.DataFrame):
             if row is None:
                 st.error("Could not resolve the selected player.")
             else:
-                pid = int(row["id"])
-                nba_pid = int(row["nba_person_id"]) if "nba_person_id" in row and not pd.isna(row["nba_person_id"]) else None
-                team_id = int(row.get("team_id", 0) or 0)
-                team_abbr = str(row.get("team_abbr") or "")
+                pid = safe_int(row.get("id"), 0)
+                nba_pid = None
+                if "nba_person_id" in row and not pd.isna(row["nba_person_id"]):
+                    nba_pid = safe_int(row["nba_person_id"], None)
+                team_id = safe_int(row.get("team_id"), 0)
+                team_abbr = safe_str(row.get("team_abbr"), "")
                 if not any(f["id"] == pid for f in favs):
                     favs.append({"id": pid, "full_name": name, "team_id": team_id, "team_abbr": team_abbr, "nba_person_id": nba_pid})
                     _save_favorites(favs); st.success("Added to favorites.")
@@ -847,7 +872,7 @@ def page_favorites(players: pd.DataFrame):
         st.subheader("Saved favorites")
         cols = st.columns(3)
         for i, f in enumerate(list(favs)):
-            abbr = f.get("team_abbr") or ""
+            abbr = safe_str(f.get("team_abbr"), "")
             color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
             logo = nba_logo_url(abbr)
             with cols[i % 3]:
@@ -855,14 +880,14 @@ def page_favorites(players: pd.DataFrame):
   <div class="glow-hdr">
     <img src="{logo or ''}" style="width:42px;height:42px;border-radius:8px;border:1px solid #222;background:#111" />
     <div>
-      <div class="glow-name">{f['full_name']}</div>
+      <div class="glow-name">{safe_str(f.get('full_name'),'')}</div>
       <div class="glow-meta">{abbr}</div>
     </div>
   </div>
 </div>""", unsafe_allow_html=True)
                 rcol = st.columns([8,1])[1]
-                if rcol.button("❌", key=f"del_{f['id']}", help="Remove from favorites"):
-                    favs = [x for x in favs if x["id"] != f["id"]]
+                if rcol.button("❌", key=f"del_{safe_int(f.get('id'),0)}", help="Remove from favorites"):
+                    favs = [x for x in favs if safe_int(x.get("id"),0) != safe_int(f.get("id"),0)]
                     _save_favorites(favs)
                     _rerun()
     else:
@@ -883,10 +908,11 @@ def page_favorites(players: pd.DataFrame):
     progress = st.progress(0, text="Predicting for favorites…")
 
     for i, fav in enumerate(favs):
-        pid, pname = fav["id"], fav["full_name"]
-        team_id = int(fav.get("team_id", 0) or 0)
-        abbr = fav.get("team_abbr") or ""
+        pid, pname = safe_int(fav.get("id"), 0), safe_str(fav.get("full_name"), "")
+        team_id = safe_int(fav.get("team_id"), 0)
+        abbr = safe_str(fav.get("team_abbr"), "")
         nba_pid = fav.get("nba_person_id")
+        nba_pid = None if nba_pid in (None, "", 0) else safe_int(nba_pid, None)
 
         logs = load_logs(pid, season)
         if logs.empty:
@@ -985,3 +1011,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
