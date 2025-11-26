@@ -1,18 +1,11 @@
 # app.py
-
 """
 NBA Prop Predictor — Pro Tier (Stability Patch + TARGET Fix + Metric Card UI)
-Performance-optimized: single-pass feature engineering, tiny-key caching, parallel per-stat training, fast trend.
+Active-only players in dropdown.
 """
 
 from __future__ import annotations
-
-import os
 import datetime
-import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,9 +14,9 @@ import data_fetching as dfetch
 from models import ModelManager
 
 
-# =============================================================================
-# CONFIG / CONSTANTS
-# =============================================================================
+# ======================================================================
+# PROP DEFINITIONS
+# ======================================================================
 
 PROP_MAP = {
     "Points": "PTS",
@@ -40,358 +33,344 @@ PROP_MAP = {
     "Minutes": "MIN",
 }
 
-STAT_COLUMNS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "MIN"]
-
-BASE_COLS = [
-    "IS_HOME",
-    "REST_DAYS",
-    "BACK_TO_BACK",
-    "OPP_ALLOW_PTS",
-    "OPP_ALLOW_REB",
-    "OPP_ALLOW_AST",
-]
-
-IGNORE_COLS = {
-    "GAME_DATE",
-    "MATCHUP",
-    "SEASON_ID",
-    "TEAM_ABBREVIATION",
-    "WL",
-    "VIDEO_AVAILABLE",
-    "OPP_TEAM",
-}
-
-N_TRAIN = 60  # why: training on last 60 games is enough and much faster
-MAX_WORKERS = max(2, min(8, os.cpu_count() or 4))  # why: parallel speed-up
+STAT_COLUMNS = ["PTS","REB","AST","STL","BLK","TOV","FG3M","MIN"]
 
 
-# =============================================================================
-# FAST UTILS
-# =============================================================================
+# ======================================================================
+# FEATURE ENGINEERING HELPERS
+# ======================================================================
 
-def _rolling_slope(values: np.ndarray, window: int) -> np.ndarray:
-    """
-    O(n) rolling slope using a closed form of linear regression over a sliding window.
-    Avoids pandas .rolling(...).apply(polyfit) which is very slow.
-
-    y indices i = 0..w-1
-    slope = (w*Σ(i*y_i) - Σi * Σy) / (w*Σ(i^2) - (Σi)^2)
-    """
-    x = np.asarray(values, dtype=float)
-    n = window
-    if x.size == 0 or n <= 1:
-        return np.full_like(x, np.nan, dtype=float)
-
-    idx = np.arange(n, dtype=float)
-    sum_i = idx.sum()
-    sum_i2 = (idx * idx).sum()
-    denom = n * sum_i2 - (sum_i ** 2)
-    if denom == 0:
-        return np.full_like(x, np.nan, dtype=float)
-
-    sum_y = np.convolve(x, np.ones(n, dtype=float), mode="valid")
-    sum_iy = np.convolve(x, idx, mode="valid")
-    slope_valid = (n * sum_iy - sum_i * sum_y) / denom
-
-    out = np.full(x.shape, np.nan, dtype=float)
-    out[n - 1:] = slope_valid
-    return out
-
-
-def _hash_frame_small(X: pd.DataFrame, y: np.ndarray, player_id: int, season: str, stat: str) -> str:
-    """
-    Tiny-key content hash. Avoid hashing entire DF bytes (slow).
-    Uses shapes, column names, and rolling checksum of sampled values.
-    """
-    h = hashlib.sha1()
-    h.update(str(player_id).encode())
-    h.update(season.encode())
-    h.update(stat.encode())
-    h.update(str(X.shape).encode())
-    h.update(",".join(map(str, X.columns)).encode())
-
-    if len(X) > 0:
-        # sample 128 rows evenly for checksum
-        idx = np.linspace(0, len(X) - 1, num=min(128, len(X)), dtype=int)
-        sample = X.iloc[idx].to_numpy()
-        h.update(np.nan_to_num(sample, nan=0.0).tobytes())
-        y_sample = y[idx if len(y) == len(X) else np.clip(idx, 0, len(y) - 1)]
-        h.update(np.nan_to_num(y_sample, nan=0.0).tobytes())
-
-    return h.hexdigest()
-
-
-# =============================================================================
-# FEATURE ENGINEERING
-# =============================================================================
-
-def compute_opponent_strength(df: pd.DataFrame) -> pd.DataFrame:
-    opp = (
-        df.groupby("OPP_TEAM")[["PTS", "REB", "AST"]]
-        .mean()
-        .rename(
-            columns={
-                "PTS": "OPP_ALLOW_PTS",
-                "REB": "OPP_ALLOW_REB",
-                "AST": "OPP_ALLOW_AST",
-            }
-        )
-    )
+def compute_opponent_strength(df):
+    opp = df.groupby("OPP_TEAM")[["PTS","REB","AST"]].mean().rename(columns={
+        "PTS": "OPP_ALLOW_PTS",
+        "REB": "OPP_ALLOW_REB",
+        "AST": "OPP_ALLOW_AST",
+    })
     return df.join(opp, on="OPP_TEAM")
 
 
-def add_context_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def lag_features(df, col):
+    df[f"{col}_L1"] = df[col].shift(1)
+    df[f"{col}_L3"] = df[col].shift(3)
+    df[f"{col}_L5"] = df[col].shift(5)
+    return df
+
+
+def rolling_features(df, col):
+    df[f"{col}_AVG5"] = df[col].rolling(5).mean()
+    df[f"{col}_AVG10"] = df[col].rolling(10).mean()
+    return df
+
+
+def trend_feature(df, col):
+    # why: simple to keep, acceptable cost for small inputs
+    df[f"{col}_TREND"] = df[col].rolling(5).apply(
+        lambda x: np.polyfit(range(len(x)), x, 1)[0] if len(x) == 5 else np.nan,
+        raw=True,
+    )
+    return df
+
+
+def context_features(df):
     df["IS_HOME"] = df["MATCHUP"].apply(lambda x: 1 if "vs" in x else 0)
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
-    df = df.sort_values("GAME_DATE")
     df["REST_DAYS"] = df["GAME_DATE"].diff().dt.days.fillna(2)
     df["BACK_TO_BACK"] = (df["REST_DAYS"] == 1).astype(int)
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_logs(player_id: int, season: str) -> pd.DataFrame:
-    # why: network IO cached; avoids repeated API hits
-    logs = dfetch.get_player_game_logs_nba(player_id, season)
-    return logs.copy()
+# ======================================================================
+# PER-PROP FEATURE BUILDER
+# ======================================================================
 
-
-def _ensure_training_base(df: pd.DataFrame) -> pd.DataFrame:
+def build_features_for_stat(df, stat):
     df = df.copy()
-    df["OPP_TEAM"] = df["MATCHUP"].str.extract(r"(?:vs\.|@)\s(.+)$")
-    df = compute_opponent_strength(df)
-    df = add_context_features(df)
-    df = df.dropna(subset=["PTS", "REB", "AST"])
-    df = df.reset_index(drop=True)
-    return df
 
-
-@st.cache_data(show_spinner=False)
-def build_all_features(df_in: pd.DataFrame) -> pd.DataFrame:
-    """
-    Single-pass feature builder for all STAT_COLUMNS.
-    Produces L1/L3/L5, AVG5/AVG10, TREND5 per stat + BASE_COLS.
-    """
-    df = _ensure_training_base(df_in)
-
-    out = df.copy()
-    # numeric cast only once
-    for c in STAT_COLUMNS:
-        out[c] = pd.to_numeric(out[c], errors="coerce").astype(float)
-
-    # Lags and rolling means
-    for c in STAT_COLUMNS:
-        s = out[c].to_numpy(dtype=float, copy=False)
-        # lags
-        out[f"{c}_L1"] = np.roll(s, 1); out.loc[out.index[0], f"{c}_L1"] = np.nan
-        out[f"{c}_L3"] = out[c].shift(3)
-        out[f"{c}_L5"] = out[c].shift(5)
-
-        # rolling means
-        out[f"{c}_AVG5"] = pd.Series(s).rolling(5, min_periods=5).mean().to_numpy()
-        out[f"{c}_AVG10"] = pd.Series(s).rolling(10, min_periods=10).mean().to_numpy()
-
-        # vectorized trend (slope) over window=5
-        out[f"{c}_TREND"] = _rolling_slope(s, 5)
-
-    # Fill base cols (no leak)
-    for bc in BASE_COLS:
-        if bc in out.columns:
-            med = float(out[bc].median()) if out[bc].notna().any() else 0.0
-            out[bc] = out[bc].fillna(med)
-
-    return out
-
-
-def select_X_for_stat(features: pd.DataFrame, stat: str) -> pd.DataFrame:
-    """
-    Choose only relevant engineered columns for the given stat, + base context.
-    """
     cols = PROP_MAP[stat] if isinstance(PROP_MAP[stat], list) else [PROP_MAP[stat]]
-    pattern_bits = []
-    for c in cols:
-        pattern_bits.extend([f"{c}_L1", f"{c}_L3", f"{c}_L5", f"{c}_AVG5", f"{c}_AVG10", f"{c}_TREND"])
 
-    keep = set(BASE_COLS) | set(pattern_bits)
-    keep = [c for c in keep if c in features.columns]
-    X = features[keep].copy()
+    for col in cols:
+        df = lag_features(df, col)
+        df = rolling_features(df, col)
+        df = trend_feature(df, col)
+
+    base_cols = [
+        "IS_HOME",
+        "REST_DAYS",
+        "BACK_TO_BACK",
+        "OPP_ALLOW_PTS",
+        "OPP_ALLOW_REB",
+        "OPP_ALLOW_AST",
+    ]
+
+    ignore = [
+        "GAME_DATE",
+        "MATCHUP",
+        "SEASON_ID",
+        "TEAM_ABBREVIATION",
+        "WL",
+        "VIDEO_AVAILABLE",
+        "OPP_TEAM",
+    ]
+
+    X = df.drop(columns=ignore, errors="ignore")
+    X = X.select_dtypes(include=["float", "int"])
+
+    for bc in base_cols:
+        if bc in df.columns:
+            X[bc] = df[bc].fillna(df[bc].median())
+
+    X = X.dropna()
     return X
 
 
-def build_target(df: pd.DataFrame, stat: str) -> pd.Series:
-    if isinstance(PROP_MAP[stat], list):
-        tgt = df[PROP_MAP[stat]].sum(axis=1)
-    else:
-        tgt = df[PROP_MAP[stat]]
-    tgt = pd.to_numeric(tgt, errors="coerce").astype(float)
-    return tgt
+# ======================================================================
+# TRAINING DATA PREPARATION
+# ======================================================================
+
+def build_training_dataset(logs):
+    if logs.empty:
+        return pd.DataFrame()
+
+    df = logs.copy()
+    df["OPP_TEAM"] = df["MATCHUP"].str.extract(r"(?:vs\.|@)\s(.+)$")
+
+    df = compute_opponent_strength(df)
+    df = context_features(df)
+
+    df = df.dropna(subset=["PTS", "REB", "AST"])
+    return df.reset_index(drop=True)
 
 
-# =============================================================================
-# MODEL CACHING (SMALL KEY) + TRAIN/PREDICT
-# =============================================================================
+# ======================================================================
+# MODEL CACHE: One model per player, per stat
+# ======================================================================
 
-def get_or_train_model_cached(
-    player_id: int,
-    season: str,
-    stat: str,
-    X: pd.DataFrame,
-    y: np.ndarray,
-) -> ModelManager:
-    """
-    In-memory cache keyed by a tiny string; avoids Streamlit hashing huge DataFrames.
-    """
-    key = _hash_frame_small(X, y, player_id, season, stat)
-    ss: Dict[str, ModelManager] = st.session_state.setdefault("model_cache", {})
-    if key in ss:
-        return ss[key]
-
-    manager = ModelManager(random_state=42)  # ensure ModelManager uses n_jobs=-1 internally if possible
+@st.cache_resource
+def get_cached_model(player_id, stat, X, y):
+    manager = ModelManager(random_state=42)
     manager.train(X, y)
-    ss[key] = manager
     return manager
 
 
-def train_predict_for_stat(
-    player_id: int,
-    season: str,
-    stat: str,
-    features: pd.DataFrame,
-    fast_mode: bool,
-) -> Dict[str, float]:
+# ======================================================================
+# ACTIVE-ONLY PLAYER LIST
+# ======================================================================
+
+def _filter_active_players(df: pd.DataFrame, season_str: str) -> pd.DataFrame:
     """
-    Single stat train/predict with fallback to fast baseline if data is small or fast_mode is enabled.
+    Robust active filter across multiple schemas.
     """
-    # Prepare TARGET
-    y_all = build_target(features, stat).to_numpy()
-    X_all = select_X_for_stat(features, stat)
+    if df.empty:
+        return df
 
-    # Align and drop NaNs together
-    df_final = pd.concat([pd.Series(y_all, name="TARGET"), X_all], axis=1).dropna()
-    if df_final.empty or len(df_final) < 12:
-        # fast baseline when too few samples
-        pred = float(np.nanmean(y_all[-10:])) if np.isfinite(y_all[-10:]).any() else float("nan")
-        return {
-            "Stat": stat,
-            "Prediction": pred,
-            "Best Model": "Baseline(10G Mean)",
-            "MAE": float("nan"),
-            "MSE": float("nan"),
-        }
+    end_year = None
+    try:
+        # season like "2025-26" -> 2026
+        parts = season_str.split("-")
+        if len(parts) == 2:
+            end_year = int("20" + parts[1]) if len(parts[1]) == 2 else int(parts[1])
+    except Exception:
+        end_year = None
 
-    y_final = df_final["TARGET"].to_numpy(dtype=float)
-    X_final = df_final.drop(columns=["TARGET"])
+    df = df.copy()
+    # normalize common fields if present
+    for col in ["first_name","last_name"]:
+        if col in df.columns and df[col].isnull().any():
+            df[col] = df[col].fillna("")
+    if "full_name" not in df.columns:
+        if {"first_name","last_name"}.issubset(df.columns):
+            df["full_name"] = (df["first_name"].astype(str).str.strip() + " " + df["last_name"].astype(str).str.strip()).str.strip()
+        elif "PLAYER" in df.columns:
+            df["full_name"] = df["PLAYER"].astype(str)
+        else:
+            df["full_name"] = df.get("full_name", "Unknown")
 
-    # Limit training rows for speed
-    if len(X_final) > N_TRAIN:
-        X_final = X_final.iloc[-N_TRAIN:].copy()
-        y_final = y_final[-N_TRAIN:].copy()
+    # start with all False, then OR in signals
+    active = pd.Series(False, index=df.index)
 
-    # Next row to predict = last row's features
-    X_next = X_final.tail(1)
+    for flag in ["is_active","IS_ACTIVE","active"]:
+        if flag in df.columns:
+            active = active | df[flag].astype(bool)
 
-    if fast_mode:
-        # Fast baseline without modeling
-        pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        return {
-            "Stat": stat,
-            "Prediction": pred,
-            "Best Model": "FastMode(10G Mean)",
-            "MAE": float("nan"),
-            "MSE": float("nan"),
-        }
+    for flag in ["STATUS","status","ROSTERSTATUS","rosterstatus"]:
+        if flag in df.columns:
+            active = active | df[flag].astype(str).str.contains("active", case=False, na=False)
 
-    # Train or fetch cached model
-    manager = get_or_train_model_cached(player_id, season, stat, X_final, y_final)
+    # consider to_year
+    for ty in ["TO_YEAR","to_year","to", "TO"]:
+        if ty in df.columns:
+            try:
+                to_vals = pd.to_numeric(df[ty], errors="coerce")
+                if end_year is not None:
+                    active = active | (to_vals >= end_year - 1)
+                else:
+                    active = active | (to_vals >= datetime.date.today().year - 1)
+            except Exception:
+                pass
 
-    _ = manager.predict(X_next)  # ensure internal state computes best.prediction
-    best = manager.best_model()
+    # team presence indicates active roster spot in most schemas
+    team_cols = [c for c in ["team_id","TEAM_ID","teamId"] if c in df.columns]
+    if team_cols:
+        any_team = df[team_cols[0]].notna() & (df[team_cols[0]] != 0)
+        active = active | any_team
 
-    return {
-        "Stat": stat,
-        "Prediction": float(best.prediction),
-        "Best Model": best.name,
-        "MAE": float(best.mae),
-        "MSE": float(best.mse),
-    }
+    # if no positives, fallback to team presence only
+    if not active.any() and team_cols:
+        active = df[team_cols[0]].notna() & (df[team_cols[0]] != 0)
 
+    out = df[active].copy()
+    return out
 
-# =============================================================================
-# STREAMLIT APP
-# =============================================================================
 
 @st.cache_data(show_spinner=False)
-def load_player_list():
+def load_player_list(season: str = "2025-26"):
+    """
+    Returns only active NBA players with columns: id, full_name, team_id.
+    """
     try:
-        p = dfetch.get_active_players_balldontlie()
-        p["full_name"] = p["first_name"] + " " + p["last_name"]
-        return p.sort_values("full_name")[["id", "full_name", "team_id"]]
+        p = dfetch.get_active_players_balldontlie()  # typically already active
+        # normalize
+        if "id" not in p.columns and "player_id" in p.columns:
+            p = p.rename(columns={"player_id":"id"})
+        if "full_name" not in p.columns and {"first_name","last_name"}.issubset(p.columns):
+            p["full_name"] = p["first_name"] + " " + p["last_name"]
+        if "team_id" not in p.columns:
+            if "team" in p.columns and isinstance(p["team"].iloc[0], dict):
+                p["team_id"] = p["team"].apply(lambda t: t.get("id") if isinstance(t, dict) else None)
+            else:
+                p["team_id"] = p.get("TEAM_ID", None)
+        p = p[["id","full_name","team_id"]].dropna(subset=["id"]).drop_duplicates(subset=["id"])
+        p = p.sort_values("full_name")
+        return p
     except Exception:
-        fallback = dfetch.get_player_list_nba()
-        fallback["full_name"] = fallback["full_name"]
-        fallback["team_id"] = None
-        return fallback[["id", "full_name", "team_id"]]
+        fb = dfetch.get_player_list_nba()
+        fb = _filter_active_players(fb, season)
+        # normalize id
+        if "id" not in fb.columns:
+            for c in ["PLAYER_ID","player_id","PersonId","PERSON_ID"]:
+                if c in fb.columns:
+                    fb = fb.rename(columns={c:"id"})
+                    break
+        # normalize team_id
+        if "team_id" not in fb.columns:
+            for c in ["TEAM_ID","teamId"]:
+                if c in fb.columns:
+                    fb = fb.rename(columns={c:"team_id"})
+                    break
+        # ensure columns
+        fb["team_id"] = fb.get("team_id", None)
+        out = fb[["id","full_name","team_id"]].dropna(subset=["id"]).drop_duplicates(subset=["id"])
+        return out.sort_values("full_name")
 
+
+# ======================================================================
+# MAIN
+# ======================================================================
 
 def main():
-    st.set_page_config(page_title="NBA Prop Predictor Pro", page_icon="🏀", layout="wide")
-    st.title("NBA Prop Predictor — Full Auto Mode (Faster)")
+    st.set_page_config(
+        page_title="NBA Prop Predictor Pro",
+        page_icon="🏀",
+        layout="wide",
+    )
 
-    players = load_player_list()
+    st.title("NBA Prop Predictor — Full Auto Mode")
+
+    season_pref = "2025-26"
+    players = load_player_list(season_pref)
 
     with st.sidebar:
         name = st.selectbox("Select Player", players["full_name"])
         row = players[players["full_name"] == name].iloc[0]
         player_id = int(row["id"])
-        fast_mode = st.toggle("Fast mode (no training, 10-game mean)", value=False)
         run = st.button("Get Predictions Now")
 
     if not run:
         st.info("Choose a player and click 'Get Predictions Now'")
         return
 
-    # Preferred season
-    season = "2025-26"
-    logs = load_logs(player_id, season)
+    # Load season (preferring 2025-26)
+    logs = dfetch.get_player_game_logs_nba(player_id, season_pref)
     if logs.empty:
         year = datetime.date.today().year
         fallback = f"{year-1}-{str(year)[-2:]}"
-        logs = load_logs(player_id, fallback)
-        season = fallback
+        logs = dfetch.get_player_game_logs_nba(player_id, fallback)
 
     if logs.empty:
         st.error("No game logs found.")
         return
 
-    # One-time feature build
-    with st.spinner("Building features…"):
-        features = build_all_features(logs)
+    df = build_training_dataset(logs)
 
-    # Parallel per-stat training/prediction
+    results = []
+
+    for stat in PROP_MAP.keys():
+        df_local = df.copy()
+
+        # TARGET (always 1D)
+        if isinstance(PROP_MAP[stat], list):
+            df_local["TARGET"] = df_local[PROP_MAP[stat]].sum(axis=1)
+        else:
+            df_local["TARGET"] = df_local[PROP_MAP[stat]]
+
+        df_local["TARGET"] = pd.to_numeric(df_local["TARGET"], errors="coerce")
+        df_local["TARGET"] = df_local["TARGET"].astype(float)
+        df_local["TARGET"] = df_local["TARGET"].squeeze()
+
+        y = df_local["TARGET"]
+
+        X = build_features_for_stat(df_local, stat)
+
+        df_final = pd.concat([y, X], axis=1).dropna()
+
+        # REMOVE DUPLICATE COLUMNS
+        df_final = df_final.loc[:, ~df_final.columns.duplicated()]
+
+        # ENSURE y_final IS 1D
+        y_final = df_final["TARGET"].astype(float).values.ravel()
+
+        X_final = df_final.drop(columns=["TARGET"])
+
+        # Train or load cached model
+        manager = get_cached_model(player_id, stat, X_final, y_final)
+
+        X_next = X_final.tail(1)
+        predictions = manager.predict(X_next)
+
+        best = manager.best_model()
+
+        results.append(
+            {
+                "Stat": stat,
+                "Prediction": best.prediction,
+                "Best Model": best.name,
+                "MAE": best.mae,
+                "MSE": best.mse,
+            }
+        )
+
+    # ======================================================================
+    # Metric Card Display (Mobile Friendly)
+    # ======================================================================
+
     st.subheader("Predicted Props (AI Model Ensemble)")
-    results: List[Dict[str, float]] = []
 
-    with st.spinner("Training models & predicting…"):
-        futures = {}
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            for stat in PROP_MAP.keys():
-                futures[ex.submit(train_predict_for_stat, player_id, season, stat, features, fast_mode)] = stat
-            for fut in as_completed(futures):
-                results.append(fut.result())
-
-    # Sort by display order of PROP_MAP
-    order_index = {k: i for i, k in enumerate(PROP_MAP.keys())}
-    results.sort(key=lambda r: order_index[r["Stat"]])
-
-    # Metric cards
     for r in results:
         with st.container():
-            st.metric(label=f"{r['Stat']}", value=(round(r["Prediction"], 2) if np.isfinite(r["Prediction"]) else "—"), delta=None)
-            st.caption(f"Model: {r['Best Model']} | MAE: {r['MAE']:.2f} | MSE: {r['MSE']:.2f}")
+            st.metric(
+                label=f"{r['Stat']}",
+                value=round(r["Prediction"], 2),
+                delta=None,
+            )
+            st.caption(
+                f"Model: {r['Best Model']} | MAE: {r['MAE']:.2f} | MSE: {r['MSE']:.2f}"
+            )
             st.markdown("---")
 
-    # Recent games
+    # ======================================================================
+    # Recent Games Table
+    # ======================================================================
+
     st.subheader("Recent Games")
     st.dataframe(
         logs[
@@ -414,3 +393,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
