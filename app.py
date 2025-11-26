@@ -16,12 +16,12 @@ from __future__ import annotations
 import os
 import io
 import json
-import zipfile
 import hashlib
+import zipfile
 import datetime as dt
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -31,7 +31,7 @@ import altair as alt
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import streamlit as st
 
-# Local modules
+# Local modules (unchanged)
 import data_fetching as dfetch
 from models import ModelManager
 
@@ -56,6 +56,7 @@ PROP_MAP = {
 }
 STAT_COLUMNS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "MIN"]
 
+# box-score order lock (requested)
 BOX_SCORE_ORDER = [
     "Points", "Rebounds", "Assists", "3PM", "Steals", "Blocks", "Turnovers", "Minutes",
     "PRA", "PR", "PA", "RA",
@@ -70,7 +71,7 @@ BASE_COLS = [
     "DEF_RTG", "DEF_RTG_PCT",
 ]
 
-# Lightweight positional emphasis multipliers per stat
+# lightweight positional multipliers
 POS_WEIGHTS: Dict[str, Dict[str, float]] = {
     "G": {"PTS": 1.00, "REB": 0.85, "AST": 1.20, "FG3M": 1.20, "STL": 1.05, "BLK": 0.80, "TOV": 1.10, "MIN": 1.00},
     "F": {"PTS": 1.00, "REB": 1.10, "AST": 1.00, "FG3M": 1.00, "STL": 1.00, "BLK": 1.00, "TOV": 1.00, "MIN": 1.00},
@@ -174,7 +175,7 @@ h1, h2, h3, h4 {
 .mm .t { font-size:.78rem; opacity:.9; }
 .mm .v { font-size:1.2rem; font-weight:800; }
 
-/* Favorites — higher contrast, bigger headshots */
+/* Favorites */
 .fav-box {
   background: linear-gradient(180deg, #0b1220 0%, #0a1324 100%);
   border: 1px solid rgba(255,255,255,.12);
@@ -383,6 +384,13 @@ def load_teams_bdl() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["id","abbreviation","full_name"])
 
+@st.cache_data(show_spinner=False)
+def team_abbr_to_id() -> dict:
+    t = load_teams_bdl()
+    if t.empty:
+        return {}
+    return {str(r["abbreviation"]): int(r["id"]) for _, r in t.iterrows() if pd.notna(r["id"])}
+
 def _safe_get_team_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "team" in out.columns and out["team"].notna().any():
@@ -418,20 +426,17 @@ def normalize_players_df(df: pd.DataFrame) -> pd.DataFrame:
         else:
             p["full_name"] = p.get("full_name","Unknown")
 
-    # team cols
     p = _safe_get_team_cols(p)
     if "team_abbr" not in p.columns or p["team_abbr"].isna().all():
         teams = load_teams_bdl()
         if "team_id" in p.columns and not p["team_id"].isna().all() and not teams.empty:
             p = p.merge(teams.rename(columns={"id":"team_id","abbreviation":"team_abbr"}), on="team_id", how="left")
 
-    # nba_person_id
     for c in ["nba_person_id","PERSON_ID","personId","nba_id"]:
         if c in p.columns:
             if c != "nba_person_id": p = p.rename(columns={c:"nba_person_id"}); break
     if "nba_person_id" not in p.columns: p["nba_person_id"] = pd.NA
 
-    # position
     if "position" not in p.columns:
         for c in ["POSITION","pos","Pos","Position"]:
             if c in p.columns: p = p.rename(columns={c:"position"}); break
@@ -614,12 +619,10 @@ def load_team_defense_pace(season: str) -> pd.DataFrame:
     agg["OPP_DEF_Z"] = (agg["OPP_DEF_PPG"] - mu_d) / sd_d
     agg["PACE_Z"] = (agg["PACE"] - mu_p) / sd_p
 
-    # Approx defensive rating: normalize allowed points by pace (per 100)
     agg["DEF_RTG"] = (agg["OPP_DEF_PPG"] / (agg["PACE"].replace(0, np.nan) / 100.0)).fillna(agg["OPP_DEF_PPG"])
-    # Lower is tougher; percentile (0..1)
     agg["DEF_RTG_PCT"] = agg["DEF_RTG"].rank(pct=True)
+
     def tier(p):
-        # 0..1 (lower is tougher)
         if p <= 0.2: return "Elite (tough)"
         if p <= 0.4: return "Strong"
         if p <= 0.6: return "Average"
@@ -628,34 +631,79 @@ def load_team_defense_pace(season: str) -> pd.DataFrame:
     agg["TIER"] = agg["DEF_RTG_PCT"].apply(tier)
     return agg
 
+def resolve_team_for_player(row: pd.Series, logs: Optional[pd.DataFrame]) -> tuple[int, str]:
+    """Resolve team reliably from row or last logs."""
+    tid = safe_int(row.get("team_id"), 0)
+    abbr = safe_str(row.get("team_abbr"), "")
+    if (tid <= 0) and abbr:
+        tid = team_abbr_to_id().get(abbr, 0)
+    if (tid <= 0 or not abbr) and logs is not None and not logs.empty:
+        if not abbr and "TEAM_ABBREVIATION" in logs.columns and logs["TEAM_ABBREVIATION"].notna().any():
+            abbr = safe_str(logs["TEAM_ABBREVIATION"].dropna().astype(str).iloc[-1], "")
+        if (tid <= 0) and "TEAM_ID" in logs.columns and logs["TEAM_ID"].notna().any():
+            tid = safe_int(logs["TEAM_ID"].dropna().iloc[-1], 0)
+    return tid, abbr
+
 @st.cache_data(show_spinner=False)
-def auto_next_opponent(team_id: int, season: str) -> Optional[Dict]:
-    """Robust finder: look ahead up to 14 days."""
-    if not team_id or int(team_id) <= 0: return None
+def auto_next_opponent(team_id: int, season: str, team_abbr: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Find next game with aggressive fallbacks; returns EST datetime + opp abbr."""
+    if (not team_id or team_id <= 0) and team_abbr:
+        team_id = team_abbr_to_id().get(team_abbr, 0)
+    if not team_id:
+        return None
+
     year = season_start_year(season)
     today = dt.date.today()
-    end = today + dt.timedelta(days=14)
     s = requests.Session(); s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
-    try:
-        r = s.get(
-            "https://www.balldontlie.io/api/v1/games",
-            params={"seasons[]": year, "team_ids[]": team_id, "start_date": today.isoformat(), "end_date": end.isoformat(), "per_page": 100},
-            timeout=10,
-        )
-        j = r.json(); data = j.get("data", [])
-        if not data: return None
 
-        def _dt(game): return dt.datetime.fromisoformat(game["date"].replace("Z","+00:00"))
-        future = [g for g in data if _dt(g) >= dt.datetime.now(tz=ZoneInfo("UTC")) - dt.timedelta(hours=6)]
-        if not future: future = data
-        nxt = sorted(future, key=_dt)[0]
-        h, v = nxt["home_team"], nxt["visitor_team"]
-        is_home = (h["id"] == team_id)
-        opp = v if is_home else h
-        dt_utc = _dt(nxt); dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
-        return {"opp_id": opp["id"], "opp_abbr": opp["abbreviation"], "is_home": is_home, "dt_utc": dt_utc, "dt_est": dt_est, "date": dt_est.date()}
-    except Exception:
+    data = []
+    for days in (30, 90, 180, 370):
+        try:
+            r = s.get(
+                "https://www.balldontlie.io/api/v1/games",
+                params={
+                    "seasons[]": year, "team_ids[]": team_id,
+                    "start_date": today.isoformat(), "end_date": (today + dt.timedelta(days=days)).isoformat(),
+                    "per_page": 100,
+                },
+                timeout=10,
+            )
+            j = r.json()
+            data = j.get("data", []) or []
+            if data: break
+        except Exception:
+            data = []
+
+    if not data:
+        try:
+            data = _bdl_paginate("https://www.balldontlie.io/api/v1/games", {"seasons[]": year, "team_ids[]": team_id})
+        except Exception:
+            data = []
+
+    if not data:
         return None
+
+    def _dt(g): return dt.datetime.fromisoformat(g["date"].replace("Z", "+00:00"))
+    now = dt.datetime.now(tz=ZoneInfo("UTC")) - dt.timedelta(hours=6)
+    future = [g for g in data if _dt(g) >= now]
+    if not future:
+        return None
+
+    nxt = sorted(future, key=_dt)[0]
+    h, v = nxt.get("home_team", {}), nxt.get("visitor_team", {})
+    is_home = (h.get("id") == team_id)
+    opp = v if is_home else h
+    dt_utc = _dt(nxt)
+    dt_est = dt_utc.astimezone(ZoneInfo("America/New_York"))
+
+    return {
+        "opp_id": opp.get("id"),
+        "opp_abbr": opp.get("abbreviation"),
+        "is_home": is_home,
+        "dt_utc": dt_utc,
+        "dt_est": dt_est,
+        "date": dt_est.date(),
+    }
 
 
 # =============================================================================
@@ -803,23 +851,20 @@ def train_predict_for_stat(
 def adjust_predictions(results: List[Dict], opp_row: Optional[pd.Series], position: str) -> List[Dict]:
     if opp_row is None or opp_row.empty:
         return results
-    # Parameters (gentle adjustments)
-    alpha_def = 0.07     # defense weight
-    beta_pace = 0.03     # pace weight
+    alpha_def = 0.07
+    beta_pace = 0.03
     pos_key = "G" if "G" in (position or "") else ("C" if "C" in (position or "") else "F")
     w = POS_WEIGHTS.get(pos_key, POS_WEIGHTS["F"])
     z = float(opp_row.get("OPP_DEF_Z", 0.0))
     pace_z = float(opp_row.get("PACE_Z", 0.0))
 
     base = {r["Stat"]: float(r["Prediction"]) for r in results if np.isfinite(r.get("Prediction", np.nan))}
-    # per-stat adjust
     for stat in ["Points","Rebounds","Assists","3PM","Steals","Blocks","Turnovers","Minutes"]:
         if stat in base:
             weight = w.get(PROP_MAP[stat] if isinstance(PROP_MAP[stat], str) else stat, 1.0)
             mult = (1 - alpha_def * z * weight) * (1 + beta_pace * pace_z)
             base[stat] = max(0.0, base[stat] * mult)
 
-    # recompute combos
     def _sum(stats): return float(sum(base.get(s, np.nan) for s in stats if s in base))
     if all(k in base for k in ["Points","Rebounds","Assists"]): base["PRA"] = _sum(["Points","Rebounds","Assists"])
     if all(k in base for k in ["Points","Rebounds"]): base["PR"] = _sum(["Points","Rebounds"])
@@ -1005,7 +1050,6 @@ def page_predict(players: pd.DataFrame):
             st.info("Pick a player to continue.")
             return
         player_id = safe_int(row.get("id"), 0)
-        team_id = safe_int(row.get("team_id"), 0)
         team_abbr = safe_str(row.get("team_abbr"), "")
         position = safe_str(row.get("position"), "")
         team_meta = TEAM_META.get(team_abbr, {})
@@ -1039,8 +1083,10 @@ def page_predict(players: pd.DataFrame):
     if logs.empty:
         st.error("No game logs found."); return
 
+    # resolve team & upcoming
+    team_id_resolved, abbr_resolved = resolve_team_for_player(row, logs)
     dp = load_team_defense_pace(season)
-    next_game = auto_next_opponent(team_id, season) if team_id > 0 else None
+    next_game = auto_next_opponent(team_id_resolved, season, abbr_resolved)
 
     load_ph = st.empty(); show_basketball_loader(load_ph, "Building features…")
     features = build_all_features(logs, season)
@@ -1081,7 +1127,7 @@ def page_predict(players: pd.DataFrame):
     load2.empty()
     results = order_results(results)
 
-    # Adjust for opponent defense/pace + position
+    # Adjust by opponent defense/pace + position
     results = adjust_predictions(results, opp_row, position)
 
     st.subheader("Projected Props")
@@ -1090,7 +1136,6 @@ def page_predict(players: pd.DataFrame):
     df_table = results_to_table(results)
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_projections")
 
-    # Share image
     logo_bytes = get_logo_or_default(team_abbr) if team_abbr else None
     img_bytes = make_share_image_trading_card(
         player_name=name, team_abbr=team_abbr, team_name=team_name,
@@ -1159,7 +1204,6 @@ def page_favorites(players: pd.DataFrame):
     all_rows = []
     for f in list(favs):
         pid, pname = safe_int(f.get("id"), 0), safe_str(f.get("full_name"), "")
-        team_id = safe_int(f.get("team_id"), 0)
         abbr = safe_str(f.get("team_abbr"), "")
         position = safe_str(f.get("position"), "")
         nba_pid = f.get("nba_person_id")
@@ -1168,7 +1212,6 @@ def page_favorites(players: pd.DataFrame):
         color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
         team_name = TEAM_META.get(abbr, {}).get("name", abbr or "")
 
-        # logs & features
         logs = load_logs(pid, season)
         if logs.empty:
             year = dt.date.today().year
@@ -1178,9 +1221,11 @@ def page_favorites(players: pd.DataFrame):
             st.warning(f"No logs for {pname}."); continue
         feats = build_all_features(logs, season)
 
-        # opponent line + context
-        next_game = auto_next_opponent(team_id, season) if team_id > 0 else None
-        txt, opp_row = _opp_line(next_game, dp)
+        # robust team + next
+        team_id_resolved, abbr_resolved = resolve_team_for_player(pd.Series(f), logs)
+        next_game = auto_next_opponent(team_id_resolved, season, abbr_resolved)
+
+        txt, opp_row = _opp_line(next_game, dp) if next_game else ("Next: N/A", None)
         upcoming_ctx = {}
         if opp_row is not None:
             upcoming_ctx.update({
@@ -1190,7 +1235,6 @@ def page_favorites(players: pd.DataFrame):
                 "DEF_RTG": float(opp_row["DEF_RTG"]), "DEF_RTG_PCT": float(opp_row["DEF_RTG_PCT"]),
             })
 
-        # predictions
         futures, res = {}, []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             for stat in PROP_MAP.keys():
@@ -1200,12 +1244,10 @@ def page_favorites(players: pd.DataFrame):
         res = adjust_predictions(res, opp_row, position)
         df_table = results_to_table(res)
 
-        # accumulate for combined CSV
         df_all = df_table.copy()
         df_all.insert(0, "Player", pname); df_all.insert(1,"Season",season)
         all_rows.append(df_all)
 
-        # render row
         with st.container():
             st.markdown('<div class="fav-box">', unsafe_allow_html=True)
             c1, c2 = st.columns([1, 5])
@@ -1244,7 +1286,7 @@ def page_favorites(players: pd.DataFrame):
 
 
 # =============================================================================
-# PAGES — RESEARCH (unchanged structure; share button exists)
+# PAGES — RESEARCH
 # =============================================================================
 
 def _season_strings(start_year: int = 2000, end_year: Optional[int] = None) -> List[str]:
@@ -1277,10 +1319,6 @@ def _window_avg(df: pd.DataFrame, n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if w.empty: return w, pd.DataFrame()
     avg = w[["PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"]].mean().to_frame("Avg").T.round(2)
     return w, avg
-
-def _season_from_date(date_val: dt.date) -> str:
-    y = date_val.year; start = dt.date(y, 10, 1)
-    return f"{y}-{str(y+1)[-2:]}" if date_val >= start else f"{y-1}-{str(y)[-2:]}"
 
 def _charts_for_window(df_w: pd.DataFrame, title_prefix: str, color: str):
     if df_w is None or df_w.empty or "GAME_DATE" not in df_w.columns: return
@@ -1352,13 +1390,11 @@ def page_research():
     logs = fetch_logs_multi(pid, seasons_all); ph.empty()
     if logs.empty: st.warning("No logs found."); return
 
-    # Most recent
     st.subheader("Most Recent Performance (Last Game Played)")
     lg = logs.copy().sort_values("GAME_DATE"); last = lg.tail(1)
     cols_show = [c for c in ["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in last.columns]
     st.dataframe(last[cols_show], use_container_width=True, hide_index=True)
 
-    # Windows
     def _section(label: str, n: int):
         w, avg = _window_avg(lg, n); st.markdown(f"### {label} Averages")
         if not avg.empty:
@@ -1370,7 +1406,6 @@ def page_research():
         else: st.info("Not enough games for this window.")
     _section("Last 5 Games", 5); _section("Last 10 Games", 10); _section("Last 20 Games", 20)
 
-    # Share (L10)
     w10, avg10 = _window_avg(lg, 10)
     if not avg10.empty:
         table = avg10.T.reset_index().rename(columns={"index":"Stat","Avg":"Pred"})
