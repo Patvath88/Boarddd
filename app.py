@@ -761,4 +761,4 @@ def make_share_image_trading_card(
 
     card=Image.new("RGBA",(980,1080),(16,22,36,245))
     cd=ImageDraw.Draw(card)
-    cd.rounded_rectangle([0,0,980,1080], radius=34, outline=(255,255,255,)
+    cd.rounded_rectangle([0,0,980,1080], radius=34, outline=(255,255,255,))
