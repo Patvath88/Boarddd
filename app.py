@@ -1,21 +1,19 @@
 # app.py
 """
-NBA Prop Predictor — Elite (Predict & Favorites only)
-- Animated basketball loaders; polished theme & card animations
-- Team-colored metric cards with prop label, predicted value, model, and confidence %
-- Robust player loading; Auto opponent; DEF_Z/ PACE_Z/ DEF×PACE
-- Favorites with glow cards and ❌
-- Model budget control (Full / Lite 3 models / Single)
+NBA Prop Predictor — Elite
+- Stable box-score order for metric cards / tables / charts
+- Predict, Favorites, Research (any player, any season)
+- Auto opponent; DEF_Z, PACE_Z, DEF×PACE features
+- Animated basketball loaders; team-colored metric cards w/ confidence
 """
 
 from __future__ import annotations
 
 import os
 import io
-import uuid
 import json
-import hashlib
 import zipfile
+import hashlib
 import datetime as dt
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -41,17 +39,23 @@ PROP_MAP = {
     "Points": "PTS",
     "Rebounds": "REB",
     "Assists": "AST",
-    "PRA": ["PTS", "REB", "AST"],
-    "PR": ["PTS", "REB"],
-    "PA": ["PTS", "AST"],
-    "RA": ["REB", "AST"],
     "3PM": "FG3M",
     "Steals": "STL",
     "Blocks": "BLK",
     "Turnovers": "TOV",
     "Minutes": "MIN",
+    "PRA": ["PTS", "REB", "AST"],
+    "PR": ["PTS", "REB"],
+    "PA": ["PTS", "AST"],
+    "RA": ["REB", "AST"],
 }
 STAT_COLUMNS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M", "MIN"]
+
+# Fixed box-score order (cards/tables/charts follow this)
+BOX_SCORE_ORDER = [
+    "Points", "Rebounds", "Assists", "3PM", "Steals", "Blocks", "Turnovers", "Minutes",
+    "PRA", "PR", "PA", "RA",
+]
 
 BASE_COLS = [
     "IS_HOME", "REST_DAYS", "BACK_TO_BACK",
@@ -134,7 +138,6 @@ h1, h2, h3, h4 {
 /* Global animations */
 @keyframes fadeIn { from {opacity:0; transform: translateY(6px)} to {opacity:1; transform:none} }
 @keyframes rise { from {opacity:.0; transform: translateY(12px)} to {opacity:1; transform:none} }
-@keyframes pulseGlow { 0%,100%{box-shadow:0 0 0 rgba(255,255,255,0)} 50%{box-shadow:0 0 28px rgba(255,255,255,.08)} }
 
 /* Cards */
 .card {
@@ -194,15 +197,7 @@ h1, h2, h3, h4 {
 }
 @keyframes dribble {
   0%   { transform: translateX(0) translateY(0); }
-  10%  { transform: translateX(10%) translateY(2px); }
-  20%  { transform: translateX(20%) translateY(0); }
-  30%  { transform: translateX(30%) translateY(2px); }
-  40%  { transform: translateX(40%) translateY(0); }
   50%  { transform: translateX(50%) translateY(2px); }
-  60%  { transform: translateX(60%) translateY(0); }
-  70%  { transform: translateX(70%) translateY(2px); }
-  80%  { transform: translateX(80%) translateY(0); }
-  90%  { transform: translateX(90%) translateY(2px); }
   100% { transform: translateX(110%) translateY(0); }
 }
 .loader-text { color:#cbd5e1; font-size:.9rem; margin-bottom:.35rem; }
@@ -270,6 +265,12 @@ def season_start_year(season: str) -> int:
 def prev_season(season: str) -> str:
     s0 = season_start_year(season)
     return f"{s0-1}-{str(s0)[-2:]}"
+
+
+# Stable result ordering
+def order_results(results: List[Dict]) -> List[Dict]:
+    rank = {name: i for i, name in enumerate(BOX_SCORE_ORDER)}
+    return sorted(results, key=lambda r: (rank.get(str(r.get("Stat")), 10_000), str(r.get("Stat"))))
 
 
 # =============================================================================
@@ -420,6 +421,28 @@ def bdl_fetch_active_players_direct() -> pd.DataFrame:
     return pd.DataFrame(out)
 
 @st.cache_data(show_spinner=False)
+def bdl_fetch_all_players_direct() -> pd.DataFrame:
+    out = []
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 (PropPredictor)"})
+    url = "https://www.balldontlie.io/api/v1/players"
+    page = 1
+    while True:
+        try:
+            r = s.get(url, params={"per_page": 100, "page": page}, timeout=8)
+            r.raise_for_status()
+            j = r.json()
+            data = j.get("data", [])
+            if not data: break
+            out.extend(data)
+            meta = j.get("meta", {})
+            if not meta or not meta.get("next_page"): break
+            page = meta["next_page"]
+        except Exception:
+            break
+    return pd.DataFrame(out)
+
+@st.cache_data(show_spinner=False)
 def load_player_list(season: str = "2025-26") -> pd.DataFrame:
     try:
         raw = dfetch.get_active_players_balldontlie()
@@ -452,6 +475,26 @@ def load_player_list(season: str = "2025-26") -> pd.DataFrame:
         p4["nba_person_id"] = p4["nba_person_id"].apply(lambda x: None if x in (None, "", 0) else int(x))
         return p4[["id","full_name","team_id","team_abbr","nba_person_id"]].drop_duplicates(subset=["id"]).sort_values("full_name").reset_index(drop=True)
     return pd.DataFrame(columns=["id","full_name","team_id","team_abbr","nba_person_id"])
+
+@st.cache_data(show_spinner=False)
+def load_player_list_all() -> pd.DataFrame:
+    # All players (for Research)
+    try:
+        fb = dfetch.get_player_list_nba()
+        p = normalize_players_df(fb)
+        if not p.empty:
+            return p[["id","full_name","team_id","team_abbr","nba_person_id"]]
+    except Exception:
+        pass
+    try:
+        raw2 = bdl_fetch_all_players_direct()
+        p2 = normalize_players_df(raw2)
+        if not p2.empty:
+            return p2[["id","full_name","team_id","team_abbr","nba_person_id"]]
+    except Exception:
+        pass
+    # fallback to active set
+    return load_player_list("2025-26")
 
 def _filter_active_players(df: pd.DataFrame, season_str: str) -> pd.DataFrame:
     if df.empty: return df
@@ -644,7 +687,6 @@ def _impute_features(X: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _confidence_from_error(mae: float, mse: float, y_scale: float) -> float:
-    # Why: convert errors to an intuitive 0–100 score, higher = better trust
     if not np.isfinite(y_scale) or y_scale <= 0: y_scale = 1.0
     rmse = np.sqrt(mse) if np.isfinite(mse) else (mae if np.isfinite(mae) else np.nan)
     if not np.isfinite(mae) and not np.isfinite(rmse):
@@ -659,20 +701,17 @@ def _apply_model_budget(manager: ModelManager, budget: str) -> None:
     if budget == "Full ensemble": 
         return
     if budget == "Lite (3 models)":
-        wanted = {"lasso","ridge","random_forest","rf"}
-    else:  # "Single (Lasso)"
-        wanted = {"lasso"}
+        wanted = {"elasticnet","hgb","stack","lasso","ridge","random_forest","rf"}  # app supports legacy names
+        wanted = {"elasticnet","hgb","stack"}  # strict trio
+    else:  # "Single (Lasso)" -> we'll map to ElasticNet as better default
+        wanted = {"elasticnet"}
     try:
         if hasattr(manager, "set_model_whitelist"):
             manager.set_model_whitelist(list(wanted)); return
         if hasattr(manager, "available_models") and isinstance(manager.available_models, list):
-            manager.available_models = [m for m in manager.available_models
-                                        if str(getattr(m, "name", m)).lower() in wanted or
-                                           str(getattr(m, "key", m)).lower() in wanted]
+            manager.available_models = [m for m in manager.available_models if str(m).lower() in wanted]
         elif hasattr(manager, "models") and isinstance(manager.models, list):
-            manager.models = [m for m in manager.models
-                              if str(getattr(m, "name", m)).lower() in wanted or
-                                 str(getattr(m, "key", m)).lower() in wanted]
+            manager.models = [m for m in manager.models if str(m).lower() in wanted]
     except Exception:
         pass
 
@@ -718,7 +757,6 @@ def train_predict_for_stat(
 
     if fast_mode or len(X_final) < MIN_ROWS_FOR_MODEL:
         pred = float(np.nanmean(y_final[-10:])) if np.isfinite(y_final[-10:]).any() else float("nan")
-        # baseline error vs local mean
         w = y_final[-10:] if len(y_final) >= 5 else y_final
         if w.size:
             m = float(np.nanmean(w))
@@ -742,18 +780,16 @@ def train_predict_for_stat(
 
 
 # =============================================================================
-# TABLE/CSV + CHARTS + SHARE
+# TABLE/CSV + CHARTS + SHARE + CARDS
 # =============================================================================
 
 def results_to_table(results: List[Dict]) -> pd.DataFrame:
-    df = pd.DataFrame(results)
-    order = {k: i for i, k in enumerate(PROP_MAP.keys())}
-    df["__order"] = df["Stat"].map(order)
-    df = df.sort_values("__order").drop(columns="__order")
+    ordered = order_results(results)
+    df = pd.DataFrame(ordered)
     df["Pred"] = pd.to_numeric(df["Prediction"], errors="coerce").round(2)
     df["MAE"]  = pd.to_numeric(df["MAE"], errors="coerce").round(2)
     df["MSE"]  = pd.to_numeric(df["MSE"], errors="coerce").round(2)
-    df["Confidence"] = pd.to_numeric(df["Confidence"], errors="coerce").round(1)
+    df["Confidence"] = pd.to_numeric(df.get("Confidence", 60.0), errors="coerce").round(1)
     return df[["Stat","Pred","Best Model","MAE","MSE","Confidence"]].rename(columns={"Best Model":"Model"})
 
 def table_downloaders(df: pd.DataFrame, filename_prefix: str) -> None:
@@ -774,13 +810,13 @@ def lighten_hex(hex_color: str, amount: float = 0.35) -> str:
 def render_metric_cards(results: List[Dict], team_color: str) -> None:
     base = team_color or "#60a5fa"
     soft = lighten_hex(base, 0.55)
+    ordered = order_results(results)
     html = ['<div class="metric-grid">']
-    for i, r in enumerate(results):
+    for i, r in enumerate(ordered):
         stat = str(r["Stat"])
         pred = f'{float(r["Prediction"]):.2f}' if np.isfinite(r["Prediction"]) else "—"
         model = safe_str(r.get("Best Model"), "—")
         conf = r.get("Confidence", 60.0)
-        # Why inline styles: dynamic team color & staggered animation delay
         html.append(f"""
 <div class="metric-card" style="background: linear-gradient(135deg, {base} 0%, {soft} 95%); animation-delay:{i*0.03:.2f}s">
   <div class="metric-title">{stat} <span class="metric-chip">{model}</span></div>
@@ -816,8 +852,9 @@ def make_share_image(player_name: str, season: str, photo_bytes: Optional[bytes]
     buf = io.BytesIO(); bg.save(buf, format="PNG", optimize=True); return buf.getvalue()
 
 def bar_chart_from_table(df: pd.DataFrame, title: str, color: str | None = None):
+    order = [s for s in BOX_SCORE_ORDER if s in df["Stat"].unique().tolist()]
     c = alt.Chart(df).mark_bar(color=color).encode(
-        x=alt.X("Stat:N", sort=df["Stat"].tolist()),
+        x=alt.X("Stat:N", sort=order),
         y=alt.Y("Pred:Q"),
         tooltip=["Stat","Pred","Model","MAE","MSE","Confidence"],
     ).properties(height=280, title=title)
@@ -846,7 +883,7 @@ def pick_player_row(players: pd.DataFrame, selected_name: str) -> Optional[pd.Se
 
 
 # =============================================================================
-# PAGES
+# PAGES — PREDICT
 # =============================================================================
 
 def page_predict(players: pd.DataFrame):
@@ -931,11 +968,12 @@ def page_predict(players: pd.DataFrame):
         for fut in as_completed(futures): results.append(fut.result())
     load2.empty()
 
-    # --- Metric cards (replace table) ---
+    # Stable order
+    results = order_results(results)
+
     st.subheader("Predicted Props")
     render_metric_cards(results, TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
 
-    # CSV + bar chart still available
     df_table = results_to_table(results)
     table_downloaders(df_table, filename_prefix=f"{name.replace(' ','_')}_{season}_predictions")
     bar_chart_from_table(df_table, title="Predictions (bars)", color=TEAM_META.get(team_abbr, {}).get("color", "#60a5fa"))
@@ -948,6 +986,10 @@ def page_predict(players: pd.DataFrame):
     cols_show = [c for c in ["GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in logs.columns]
     st.dataframe(logs[cols_show], use_container_width=True)
 
+
+# =============================================================================
+# PAGES — FAVORITES
+# =============================================================================
 
 def page_favorites(players: pd.DataFrame):
     st.header("Favorites (Auto Opp • Defense & Pace • Glow Cards)")
@@ -1063,13 +1105,17 @@ def page_favorites(players: pd.DataFrame):
             for stat in PROP_MAP.keys():
                 futures[ex.submit(train_predict_for_stat, pid, season, stat, feats, fast_mode, model_budget, upcoming_ctx)] = stat
             for fut in as_completed(futures): res.append(fut.result())
+
+        # Stable order
+        res = order_results(res)
+
         df_table = results_to_table(res)
         df_table.insert(0, "Player", pname); df_table.insert(1, "Season", season)
         all_rows.append(df_table)
 
         team_color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
         c = alt.Chart(df_table.rename(columns={"Pred":"Prediction"})).mark_bar(color=team_color).encode(
-            x=alt.X("Stat:N", sort=df_table["Stat"].tolist()),
+            x=alt.X("Stat:N", sort=[s for s in BOX_SCORE_ORDER if s in df_table["Stat"].unique().tolist()]),
             y=alt.Y("Prediction:Q"),
             tooltip=["Stat","Prediction","Model","MAE","MSE","Confidence"],
         ).properties(width="container", height=220, title=f"{pname} — Predictions")
@@ -1097,6 +1143,136 @@ def page_favorites(players: pd.DataFrame):
 
 
 # =============================================================================
+# PAGES — RESEARCH (any player, any season)
+# =============================================================================
+
+def _season_strings(start_year: int = 1996, end_year: Optional[int] = None) -> List[str]:
+    if end_year is None:
+        end_year = dt.date.today().year
+    seasons = []
+    for y in range(start_year, end_year + 1):
+        seasons.append(f"{y}-{str(y+1)[-2:]}")
+    return seasons
+
+def fetch_logs_multi(player_id: int, seasons: List[str]) -> pd.DataFrame:
+    frames = []
+    for s in seasons:
+        try:
+            g = load_logs(player_id, s)
+            if not g.empty:
+                g = g.copy(); g["SEASON"] = s
+                frames.append(g)
+        except Exception:
+            continue
+    if not frames: return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    if "GAME_DATE" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+        df = df.sort_values(["SEASON","GAME_DATE"])
+    return df
+
+def page_research():
+    st.header("Research")
+    st.caption("Search any player, select any season(s), view **all data** (logs, summaries, features, charts).")
+
+    all_players = load_player_list_all()
+    if all_players.empty:
+        st.error("Could not load player index."); return
+
+    # Search UX: type to filter → pick from matches
+    q = st.text_input("Search player (min 2 chars)", "")
+    matches = all_players
+    if len(q.strip()) >= 2:
+        qq = q.strip().lower()
+        mask = all_players["full_name"].astype(str).str.lower().str.contains(qq, na=False)
+        matches = all_players[mask].copy()
+    names = matches["full_name"].astype(str).tolist() or all_players["full_name"].astype(str).tolist()
+    name = st.selectbox("Choose player", names, index=0 if names else None, key="research_pick")
+
+    row = pick_player_row(matches if len(q.strip())>=2 else all_players, name)
+    if row is None:
+        st.info("Select a player to continue.")
+        return
+
+    pid = safe_int(row.get("id"), 0)
+    nba_pid = None if pd.isna(row.get("nba_person_id")) else safe_int(row.get("nba_person_id"), None)
+    abbr = safe_str(row.get("team_abbr"), "")
+    color = TEAM_META.get(abbr, {}).get("color", "#60a5fa")
+
+    # Seasons UI
+    seasons_all = _season_strings(2000, dt.date.today().year)
+    default_season = seasons_all[-1]
+    sel = st.multiselect("Seasons", seasons_all, default=[default_season])
+
+    colA, colB = st.columns([1,3])
+    with colA:
+        photo = get_player_photo_bytes(pid, nba_pid)
+        st.image(_safe_image_from_bytes(photo, (220, 220)), caption=name)
+        run = st.button("Load data")
+    with colB:
+        pass
+
+    if not run:
+        st.info("Pick seasons and click **Load data**.")
+        return
+
+    ph = st.empty(); show_basketball_loader(ph, "Loading game logs…")
+    logs = fetch_logs_multi(pid, sel)
+    ph.empty()
+    if logs.empty:
+        st.warning("No logs found for selected seasons."); return
+
+    st.subheader("Game Logs")
+    cols_show = [c for c in ["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST","FG3M","STL","BLK","TOV","MIN"] if c in logs.columns]
+    st.dataframe(logs[cols_show], use_container_width=True)
+
+    # Summary per season
+    st.subheader("Summary (per season)")
+    summary = logs.groupby("SEASON", as_index=False).agg(
+        GP=("GAME_DATE","count"),
+        PTS=("PTS","mean"),
+        REB=("REB","mean"),
+        AST=("AST","mean"),
+        FG3M=("FG3M","mean"),
+        STL=("STL","mean"),
+        BLK=("BLK","mean"),
+        TOV=("TOV","mean"),
+        MIN=("MIN","mean"),
+    )
+    st.dataframe(summary.round(2), use_container_width=True)
+
+    # Charts
+    st.subheader("Charts")
+    # Line: points by date
+    if {"GAME_DATE","PTS"}.issubset(logs.columns):
+        c1 = alt.Chart(logs).mark_line(color=color).encode(
+            x="GAME_DATE:T", y="PTS:Q", tooltip=["SEASON","GAME_DATE","MATCHUP","PTS","REB","AST"]
+        ).properties(height=260, title="Points over time")
+        st.altair_chart(c1, use_container_width=True)
+
+    # Bar: per-season averages (PTS/REB/AST)
+    long = summary.melt(id_vars=["SEASON"], value_vars=["PTS","REB","AST"], var_name="Stat", value_name="Avg")
+    c2 = alt.Chart(long).mark_bar(color=color).encode(
+        x=alt.X("SEASON:N", sort=sel),
+        y="Avg:Q",
+        column=alt.Column("Stat:N", sort=["PTS","REB","AST"]),
+        tooltip=["SEASON","Stat","Avg"]
+    ).properties(height=220, title="Season averages").resolve_scale(y='independent')
+    st.altair_chart(c2, use_container_width=True)
+
+    # Optional: compute features for one season (first selected)
+    st.subheader("Features (sample)")
+    sel0 = sel[0]
+    lf = logs[logs["SEASON"] == sel0].copy()
+    if not lf.empty:
+        feats = build_all_features(lf, sel0)
+        show_cols = [c for c in ["GAME_DATE","MATCHUP","IS_HOME","REST_DAYS","BACK_TO_BACK","OPP_DEF_PPG","OPP_DEF_Z","OPP_PACE","OPP_PACE_Z","OPP_DEF_X_PACE","PTS_L1","PTS_AVG5","PTS_TREND"] if c in feats.columns]
+        st.dataframe(feats[show_cols].tail(15), use_container_width=True)
+    else:
+        st.info("No games in the first selected season to compute features.")
+
+
+# =============================================================================
 # APP
 # =============================================================================
 
@@ -1106,19 +1282,21 @@ def main():
 
     with st.sidebar:
         st.markdown("## Navigation")
-        page = st.radio("Go to", ["Predict", "Favorites"], label_visibility="collapsed")
+        page = st.radio("Go to", ["Predict", "Favorites", "Research"], label_visibility="collapsed")
         st.markdown("---")
         if st.button("🔄 Refresh players"):
-            load_player_list.clear()
+            load_player_list.clear(); load_player_list_all.clear()
             _rerun()
-        st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">Cards</span> <span class="tag">Share</span>', unsafe_allow_html=True)
+        st.markdown('<span class="tag">Auto Opp</span> <span class="tag">Defense</span> <span class="tag">Pace</span> <span class="tag">Cards</span> <span class="tag">Share</span> <span class="tag">Research</span>', unsafe_allow_html=True)
 
     players = load_player_list("2025-26")
 
     if page == "Predict":
         page_predict(players)
-    else:
+    elif page == "Favorites":
         page_favorites(players)
+    else:
+        page_research()
 
 
 if __name__ == "__main__":
